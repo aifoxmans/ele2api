@@ -1,0 +1,101 @@
+name: Pre-production Docker
+
+on:
+  push:
+    branches: [pre]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ele2api-pre-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: aifoxmans
+  IMAGE_NAME: ele2api
+  DEPLOY_PATH: /home/btcfoxman/docker/ele2api
+  DEPLOY_SERVICE: ele2api
+  ELE2API_HOSTNAME: ele2api.aiid.edu.kg
+  ELE2API_ORIGIN: http://127.0.0.1:8817
+  CLOUDFLARED_CONFIG: /etc/cloudflared/config.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Verify application
+        env:
+          ELE_API_KEY: ci-only-api-key
+          ELE_ADMIN_TOKEN: ci-only-admin-token
+          ELE_DATA_DIR: /tmp/ele2api-ci
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pytest -q
+          python -m compileall -q app
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/aifoxmans/ele2api:${{ github.sha }}
+            ghcr.io/aifoxmans/ele2api:pre
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64, ele2api-pre]
+    timeout-minutes: 40
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate registry credentials
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/ele2api-docker-auth" >> "$GITHUB_ENV"
+      - name: Log in to registry with bounded retries
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+      - name: Pull image and restart persisted service
+        run: bash scripts/deploy_pre.sh
+      - name: Configure Cloudflared ingress
+        run: bash scripts/cloudflared_pre.sh
+      - name: Verify public endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 10 "https://${ELE2API_HOSTNAME}/health" >/dev/null; then exit 0; fi
+            sleep 5
+          done
+          exit 1
