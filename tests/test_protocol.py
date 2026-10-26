@@ -211,6 +211,20 @@ def test_poll_uses_exact_ids_original_result_and_task_specific_final_price():
     assert extract_result_urls({"status": "pending", "content_url": value["content_url"]}) == []
 
 
+def test_generating_poll_keeps_original_task_running_until_completed():
+    client = bare_client()
+    value = {"id": "generation-1", "generation_session_id": "session-1", "status": "generating"}
+    calls = []
+    client.request = lambda method, path: calls.append((method, path)) or value
+    result = client.poll("generation-1", "session-1")
+    assert result["status"] == "running" and result["upstream_status"] == "generating"
+    assert not result.get("result_urls") and result.get("credits_consumed") is None
+    value.update(status="completed", content_url="https://output.example.test/original.mp4", price={"credits": 123.45})
+    completed = client.poll("generation-1", "session-1")
+    assert completed["status"] == "succeeded" and completed["credits_consumed"] == 123.45
+    assert calls == [("GET", GENERATION + "/generation-1")] * 2
+
+
 def test_failed_poll_preserves_real_cause_and_never_invents_deducted_credits():
     client = bare_client()
     client.request = lambda *a: {"id": "g", "generation_session_id": "s", "status": "failed",

@@ -324,6 +324,6 @@ class EleClient:
                 raise EleError("ElevenLabs completed generation returned no original result URL")
             return {"status": "succeeded", "progress": 100, "result_urls": urls, "upstream_status": status,
                     "metadata": value.get("file_properties") or {}, **_price_evidence(value.get("price"), actual=True)}
-        if status not in {"pending", "queued", "processing", "running", "in_progress"}:
+        if status not in {"pending", "queued", "processing", "running", "in_progress", "generating"}:
             raise EleError("ElevenLabs generation returned an unrecognized status")
         return {"status": "running", "progress": 45, "upstream_status": status}
