@@ -1,4 +1,4 @@
-"""ElevenLabs video capabilities observed in the authenticated web configuration."""
+"""Observed ElevenLabs capabilities and documented model input requirements."""
 
 from __future__ import annotations
 
@@ -58,8 +58,10 @@ class ModelSpec:
     def material_constraints(self) -> dict[str, Any]:
         if self.family in {"2.0", "2.5"}:
             maximum = 30.1 if self.family == "2.5" else 15.1
+            # Seedance requires each audio clip to be at least two seconds:
+            # https://docs.volcengine.com/docs/ark/create-video-generation-task-api?lang=zh
             return {"videos": {"max_duration": maximum, "min_total_duration": 2, "max_total_duration": maximum},
-                    "audios": {"max_duration": maximum, "max_total_duration": maximum}}
+                    "audios": {"min_duration": 2, "max_duration": maximum, "max_total_duration": maximum}}
         if self.family == "minimax":
             return {"videos": {"min_duration": 2, "max_duration": 15.1, "max_total_duration": 15.1},
                     "audios": {"min_duration": 2, "max_duration": 15.1, "max_total_duration": 15.1}}

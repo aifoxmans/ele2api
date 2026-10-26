@@ -23,7 +23,10 @@ function elapsed(task) { const end = Number(task.completed_at || Date.now() / 10
 function badge(status) { const labels = { active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", verification_required: "需验证", challenge_required: "需验证", onboarding_required: "待完善资料", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", submission_unknown: "提交待核实", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
 function proxyLabel(value) { try { const url = new URL(value); return `${url.hostname}:${url.port}`; } catch { return value || "直连"; } }
 function failureMessage(task) {
-  return task.public_error?.public_message || task.public_error?.message || "生成失败，积分已返还，请重试~";
+  const normalized = task.public_error?.public_message || task.public_error?.message;
+  if (normalized) return normalized;
+  if (task.status === "submission_unknown" || ["UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "UPSTREAM_TIMEOUT"].includes(String(task.error_code || "").toUpperCase())) return "提交结果未确认，请核对上游任务，暂勿重复提交~";
+  return "生成失败，积分已返还，请重试~";
 }
 
 function renderAccounts() {
@@ -92,7 +95,12 @@ function renderModels(resetPayload = true) {
 }
 function validateJson() { try { JSON.parse($("#requestJson").value); $("#jsonValidation").textContent = "JSON 有效"; $("#jsonValidation").className = "validation"; return true; } catch (error) { $("#jsonValidation").textContent = error.message; $("#jsonValidation").className = "validation error"; return false; } }
 
-function callerResponse(task) { const value = { id: task.id, object: "video.generation", model: task.model, status: task.status, progress: task.progress, data: (task.result_urls || []).map((url) => ({ url })) }; if (terminal.has(task.status) && task.status !== "succeeded") value.error = { code: task.error_code, message: failureMessage(task) }; return value; }
+function callerResponse(task) {
+  if (task.caller_response && typeof task.caller_response === "object" && !Array.isArray(task.caller_response)) return task.caller_response;
+  const value = { id: task.id, object: "video", created_at: task.created_at, model: task.model, status: task.status, progress: task.progress, data: (task.result_urls || []).map((url) => ({ type: "video", url })), account_id: task.account_id ?? null };
+  if ((terminal.has(task.status) || task.status === "submission_unknown") && task.status !== "succeeded") value.error = task.public_error || { code: task.error_code, message: failureMessage(task) };
+  return value;
+}
 function renderAudit() { const values = { caller_request: state.detail?.caller_request, upstream_request: state.detail?.upstream_request, upstream_response: state.detail?.upstream_response, caller_response: state.detail ? callerResponse(state.detail) : {} }; $("#auditCode").textContent = JSON.stringify(values[state.auditKey] || {}, null, 2); }
 function showDetail(task) {
   $("#resumeTaskButton").hidden = !["submission_unknown", "expired"].includes(task.status) || !task.run_id || !task.thread_id;

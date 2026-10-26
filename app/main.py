@@ -403,8 +403,9 @@ def model_costs() -> list[dict[str, Any]]:
 def admin_tasks(limit: int = 100) -> list[dict[str, Any]]:
     tasks = store.tasks(max(1, min(limit, 10000)))
     for task in tasks:
+        task["caller_response"] = service.public_task(task)
         if task["status"] in {"failed", "expired", "submission_unknown"}:
-            task["public_error"] = service.public_task(task)["error"]
+            task["public_error"] = task["caller_response"]["error"]
     return [_with_cost_observations(task) for task in tasks]
 
 
@@ -417,8 +418,9 @@ def admin_create_task(body: dict[str, Any] = Body(...),
 @app.get("/api/tasks/{task_id}", dependencies=[Depends(admin_auth)])
 def admin_task(task_id: str) -> dict[str, Any]:
     task = _task(task_id)
+    task["caller_response"] = service.public_task(task)
     if task["status"] in {"failed", "expired", "submission_unknown"}:
-        task["public_error"] = service.public_task(task)["error"]
+        task["public_error"] = task["caller_response"]["error"]
     return _with_cost_observations(task)
 
 

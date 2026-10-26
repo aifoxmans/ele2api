@@ -1,6 +1,16 @@
 """Caller messages follow the operator's fixed normalization vocabulary."""
 from __future__ import annotations
 
+import re
+
+
+def _unsupported_media_duration(raw: str) -> bool:
+    """Recognize an explicit input-length rejection, never infer from a task."""
+    return bool(re.search(
+        r"\b(?:audio|video)(?:\s+(?:files?|clips?|references?))?"
+        r"(?:\s+(?:is|are|was|were))?\s+too\s+(?:short|long)\b", raw,
+    )) or ("duration" in raw and any(value in raw for value in ("invalid", "must", "unsupported")))
+
 
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
@@ -41,7 +51,7 @@ def public_error(code: str, message: str) -> dict[str, str]:
     elif kind == "MEDIA_FORMAT_UNSUPPORTED" or "wrong content type" in raw:
         public = "素材格式不支持，请修改后再试~"
         category = "invalid_request"
-    elif kind == "VIDEO_EDIT_CONSTRAINT" or "duration" in raw and any(value in raw for value in ("invalid", "must", "unsupported")):
+    elif kind in {"VIDEO_EDIT_CONSTRAINT", "MEDIA_DURATION_UNSUPPORTED"} or _unsupported_media_duration(raw):
         public = "素材时长不支持，请修改后再试~"
         category = "invalid_request"
     elif kind in {"ACCOUNT_POOL_UNAVAILABLE", "ACCOUNT_MODEL_UNAVAILABLE", "ACCOUNT_MISSING", "BROWSERERROR", "INSUFFICIENT_CREDITS", "UPSTREAM_TEMPORARY", "MEDIA_UPLOAD_FAILED", "CAPTCHA_REQUIRED", "LOGIN_REQUIRED", "LOGIN_FAILED"} or any(value in raw for value in (

@@ -316,7 +316,8 @@ def validate_material_durations(normalized: dict[str, Any], assets: dict[str, li
             limits = constraints.get(kind) or {}
             minimum, maximum = limits.get("min_duration"), limits.get("max_duration")
             if minimum is not None and duration < minimum or maximum is not None and duration > maximum:
-                raise BrowserRejected(f"{normalized['model']} {kind} reference duration exceeds the model's observed limits")
+                raise BrowserRejected(f"unsupported reference duration: {normalized['model']} {kind} "
+                                      f"{duration:g}s outside the model's limits")
             if kind == "videos" and limits.get("min_dimension"):
                 width, height = int(item.get("width") or 0), int(item.get("height") or 0)
                 if min(width, height) < limits["min_dimension"]:

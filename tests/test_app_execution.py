@@ -1,6 +1,9 @@
 import importlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import shutil
+import subprocess
 import threading
 import time
 
@@ -260,6 +263,72 @@ def test_batch_login_api_sanitizes_private_fields_and_protects_login_identity(se
                           json={"model": "sd-2-0-mini", "prompt": "lake", "login_password": "private-password"})
     assert accidental.status_code == 422
     assert service.store.tasks() == [] and service._pool.calls == []
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "expired", "submission_unknown"])
+def test_admin_task_caller_projection_matches_public_api_without_mutating_tasks(service, monkeypatch, status):
+    monkeypatch.setenv("ELE_API_KEY", "test-api")
+    monkeypatch.setenv("ELE_ADMIN_TOKEN", "test-admin")
+    monkeypatch.setenv("ELE_DATA_DIR", str(service.store.path.parent / "unused-main"))
+    main = importlib.import_module("app.main")
+    monkeypatch.setattr(main, "store", service.store)
+    monkeypatch.setattr(main, "service", service)
+    monkeypatch.setattr(main, "ADMIN_TOKEN", "projection-admin")
+    monkeypatch.setattr(main, "API_KEY", "projection-api")
+    task = service.create({"model": "sd-2-0-mini", "prompt": "A synthetic landscape"})
+    code = "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" if status == "submission_unknown" else "UPSTREAM_FAILED"
+    raw = "Synthetic private upstream diagnostic"
+    service.store.update_task(task["id"], {"status": status, "account_id": 1, "run_id": "known-run",
+        "thread_id": "known-session", "error_code": code, "error_message": raw,
+        "result_urls": ["https://example.test/result.mp4"] if status == "succeeded" else []})
+    before = service.store.task(task["id"])
+    api = TestClient(main.app)  # No lifespan or background workers.
+    assert api.get("/api/tasks/" + task["id"]).status_code == 401
+    admin = {"X-Admin-Token": "projection-admin"}
+    detail = api.get("/api/tasks/" + task["id"], headers=admin).json()
+    listed = api.get("/api/tasks", headers=admin).json()[0]
+    caller = api.get("/v1/videos/" + task["id"], headers={"Authorization": "Bearer projection-api"}).json()
+    assert detail["caller_response"] == listed["caller_response"] == caller
+    assert detail["upstream_response"]["error_message"] == raw
+    assert raw not in json.dumps(caller)
+    if status == "succeeded":
+        assert "error" not in caller and "public_error" not in detail
+        assert caller["data"] == [{"type": "video", "url": "https://example.test/result.mp4"}]
+    else:
+        assert detail["public_error"] == listed["public_error"] == caller["error"]
+        assert caller["error"]["message"] != raw
+    assert service.store.task(task["id"]) == before
+    assert Client.submissions == 0 and len(service._pool.calls) == 1
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is needed only for the pure frontend helper contract")
+def test_detail_response_helper_prefers_server_and_preserves_legacy_unknown_error():
+    source = (Path(__file__).parents[1] / "app/static/app.js").read_text(encoding="utf-8")
+    failure = source[source.index("function failureMessage("):source.index("function renderAccounts(")]
+    response = source[source.index("function callerResponse("):source.index("function renderAudit(")]
+    script = r'''
+const assert=require('node:assert/strict');
+const terminal=new Set(['succeeded','failed','expired']);
+HELPERS
+const normalized={code:'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',message:'normalized response',public_message:'normalized response',category:'submission_unknown'};
+const actual={id:'task',object:'video',status:'submission_unknown',error:normalized,credits_consumed:null,cost_source:'unknown'};
+const task={id:'task',model:'sample',status:'submission_unknown',progress:35,error_code:'RAW_CODE',error_message:'private upstream',public_error:normalized};
+assert.strictEqual(callerResponse({...task,caller_response:actual}),actual);
+assert.deepStrictEqual(callerResponse(task).error,normalized);
+assert(!JSON.stringify(callerResponse(task)).includes(task.error_message));
+const old={...task};delete old.public_error;
+const unknown='提交结果未确认，请核对上游任务，暂勿重复提交~';
+assert.strictEqual(callerResponse(old).error.message,unknown);
+assert.strictEqual(callerResponse(old).object,'video');
+assert.strictEqual(failureMessage({...old,status:'failed',error_code:'UPSTREAM_TIMEOUT'}),unknown);
+assert.strictEqual(failureMessage({...old,status:'failed',error_code:'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'}),unknown);
+assert(!JSON.stringify(callerResponse(old)).includes(task.error_message));
+assert(!('error'in callerResponse({...task,status:'succeeded'})));
+assert.deepStrictEqual(callerResponse({...task,status:'succeeded',result_urls:['https://example.test/video.mp4']}).data,[{type:'video',url:'https://example.test/video.mp4'}]);
+console.log('frontend response contracts passed');
+'''.replace("HELPERS", failure + response)
+    result = subprocess.run([shutil.which("node"), "-e", script], check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == "frontend response contracts passed"
 
 
 @pytest.mark.parametrize("enabled", [False, True])
