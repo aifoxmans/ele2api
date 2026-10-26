@@ -93,12 +93,20 @@ def build_submit_body(normalized: dict[str, Any], assets: dict[str, list[dict[st
 
 
 def extract_result_urls(value: dict[str, Any]) -> list[str]:
-    """Return only the finalized original output, never previews or references."""
+    """Prefer the official original attachment, with original playback fallback."""
     if value.get("status") != "completed":
         return []
-    url = value.get("content_url") or value.get("download_url")
-    parsed = urlsplit(str(url or ""))
-    return [url] if parsed.scheme == "https" and parsed.hostname else []
+    for field in ("download_url", "content_url"):
+        url = value.get(field)
+        if not isinstance(url, str):
+            continue
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        if parsed.scheme == "https" and parsed.hostname:
+            return [url]
+    return []
 
 
 def _price_evidence(value: Any, *, actual: bool = False) -> dict[str, Any]:

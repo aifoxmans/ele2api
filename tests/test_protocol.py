@@ -198,17 +198,33 @@ def test_poll_uses_exact_ids_original_result_and_task_specific_final_price():
     client = bare_client()
     value = {"id": "generation-1", "generation_session_id": "session-1", "status": "completed",
              "content_url": "https://output.example.test/original.mp4", "preview_content_url": "https://output.example.test/preview.mp4",
+             "download_url": "https://output.example.test/original.mp4?response-content-disposition=attachment",
+             "capped_resolution_content_url": "https://output.example.test/capped.mp4",
              "file_properties": {"width": 560, "height": 752}, "price": {"credits": 123.45}}
     calls = []
     client.request = lambda method, path: calls.append((method, path)) or value
     result = client.poll("generation-1", "session-1")
     assert calls == [("GET", GENERATION + "/generation-1")]
-    assert result["result_urls"] == [value["content_url"]]
+    assert result["result_urls"] == [value["download_url"]]
     assert result["credits_consumed"] == 123.45 and result["cost_evidence"]["charged"] == 123.45
     value["generation_session_id"] = "unrelated-session"
     with pytest.raises(EleError, match="identity"):
         client.poll("generation-1", "session-1")
     assert extract_result_urls({"status": "pending", "content_url": value["content_url"]}) == []
+
+
+@pytest.mark.parametrize("download", [None, "", "http://output.example.test/a.mp4", "https://[invalid", {"url": "https://output.example.test/a.mp4"}])
+def test_original_playback_fallback_never_uses_preview_or_capped_output(download):
+    value = {"status": "completed", "download_url": download,
+             "content_url": "https://output.example.test/original.mp4",
+             "preview_content_url": "https://output.example.test/preview.mp4",
+             "capped_resolution_content_url": "https://output.example.test/capped.mp4"}
+    assert extract_result_urls(value) == [value["content_url"]]
+    value.pop("content_url")
+    assert extract_result_urls(value) == []
+    value["download_url"] = "https://output.example.test/original.mp4?attachment=1"
+    value["status"] = "generating"
+    assert extract_result_urls(value) == []
 
 
 def test_generating_poll_keeps_original_task_running_until_completed():
