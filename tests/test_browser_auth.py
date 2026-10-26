@@ -66,9 +66,12 @@ def test_each_captcha_call_requests_a_fresh_normal_website_challenge(monkeypatch
     monkeypatch.setattr(browser, 'evaluate', evaluate)
     assert browser.hcaptcha_token() != browser.hcaptcha_token()
     assert len(expressions) == 2 and all('hcaptcha.execute' in expression for expression in expressions)
+    assert all('https://js.hcaptcha.com/1/api.js?render=explicit' in expression for expression in expressions)
 
 
-@pytest.mark.parametrize('message', ['CAPTCHA_REQUIRED: normal browser verification', 'LOGIN_FAILED: sign-in failed'])
+@pytest.mark.parametrize('message', ['CAPTCHA_REQUIRED: normal browser verification', 'LOGIN_FAILED: sign-in failed',
+                                   'ElevenLabs model sample is not available for this account',
+                                   'ElevenLabs model sample is restricted for this account'])
 def test_login_and_captcha_errors_use_fixed_maintenance_message(message):
     result = public_error('BROWSERREJECTED', message)
     assert result['message'] == '上游维护中，请稍后再试~'

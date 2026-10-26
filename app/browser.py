@@ -64,8 +64,20 @@ def refresh_firebase_auth(account: dict[str, Any]) -> dict[str, Any]:
 def _restore_managed_auth(account: dict[str, Any], port: int) -> None:
     if account.get("access_token") or account.get("refresh_token"):
         browser = CDPBrowser(port)
-        if not browser.collect_auth().get("access_token"):
-            browser.restore_auth(account)
+        deadline = time.monotonic() + 8
+        while True:
+            try:
+                if browser.collect_auth().get("access_token"):
+                    return
+                if browser.evaluate("document.readyState") in {"interactive", "complete"}:
+                    browser.restore_auth(account)
+                    return
+            except BrowserError:
+                if time.monotonic() >= deadline:
+                    raise
+            if time.monotonic() >= deadline:
+                raise BrowserError("the account browser is still initializing; retry verification")
+            time.sleep(.2)
 
 
 def account_proxy_url(account: dict[str, Any]) -> str:
@@ -345,6 +357,11 @@ class CDPBrowser:
         with _PROCESS_LOCK:
             guard = _CAPTCHA_LOCKS.setdefault(self.port, threading.RLock())
         expression = r'''(async()=>{
+          if(!window.hcaptcha?.render&&!document.getElementById('__ele_api_hcaptcha_sdk')) {
+            const script=document.createElement('script');script.id='__ele_api_hcaptcha_sdk';script.async=true;script.defer=true;
+            script.src='https://js.hcaptcha.com/1/api.js?render=explicit&recaptchacompat=off';
+            document.head.appendChild(script);
+          }
           const deadline=Date.now()+20000;
           while(!window.hcaptcha?.render&&Date.now()<deadline)await new Promise(r=>setTimeout(r,200));
           if(!window.hcaptcha?.render)return {error:'CAPTCHA_REQUIRED'};
