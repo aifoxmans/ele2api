@@ -240,6 +240,71 @@ def test_known_creator_benefits_notice_only_closes_then_uses_actual_platform_sel
     assert ('platform', 'platform') not in page.actions
 
 
+def test_exact_image_video_intro_advances_then_enters_normal_account_onboarding(clock, monkeypatch):
+    page = CapturedOnboarding()
+    prior_view, prior_click = page._onboarding_view, page.click
+    notice, entered, commands = [True], [], []
+
+    def view():
+        if notice[0]:
+            return {'stage': 'image-video-intro', 'controls': {'get-started': {'x': 99, 'y': 10}}}
+        if not entered:
+            return {'stage': 'waiting', 'onboarding_path': False, 'controls': {}}
+        return prior_view()
+
+    def click(x, y):
+        if notice[0]:
+            assert (x, y) == (99, 10)
+            notice[0] = False
+            page.actions.append(('image-video-intro', 'get-started'))
+        else:
+            prior_click(x, y)
+
+    def command(method, params=None):
+        commands.append((method, params))
+        if method == 'Page.navigate':
+            assert params == {'url': BASE + '/app/onboarding'}
+            entered.append(True)
+        else:
+            assert method == 'Page.bringToFront'
+        return {}
+
+    monkeypatch.setattr(page, '_onboarding_view', view)
+    monkeypatch.setattr(page, 'click', click)
+    monkeypatch.setattr(page, 'command', command)
+    assert page.complete_onboarding(auth(), expected_email=EMAIL) == auth()
+    assert page.actions[0] == ('image-video-intro', 'get-started')
+    assert len(entered) == 1 and page.complete
+
+
+def test_feature_intro_does_not_authorize_followup_model_approval(clock, monkeypatch):
+    page = CDPBrowser(12345)
+    clicks = []
+    monkeypatch.setattr(page, 'collect_auth', auth)
+    monkeypatch.setattr(page, '_onboarding_complete_on_server', lambda account_auth: False)
+    monkeypatch.setattr(page, '_onboarding_view', lambda: {
+        'stage': 'unknown-dialog' if clicks else 'image-video-intro',
+        'controls': {'approve-models': {'x': 3, 'y': 4}} if clicks else {'get-started': {'x': 1, 'y': 2}}})
+    monkeypatch.setattr(page, 'click', lambda x, y: clicks.append((x, y)))
+    with pytest.raises(BrowserRejected, match='ONBOARDING_REQUIRED'):
+        page.complete_onboarding(auth(), expected_email=EMAIL)
+    assert clicks == [(1, 2)]
+
+
+def test_feature_intro_dom_identity_requires_complete_references_content_and_single_button(monkeypatch):
+    page = CDPBrowser(12345)
+    expressions = []
+    monkeypatch.setattr(page, 'evaluate', lambda expression: expressions.append(expression) or {})
+    page._onboarding_view()
+    source = expressions[0]
+    assert "reference('aria-labelledby','H3','Introducing Image & Video')" in source
+    assert "reference('aria-describedby','P','Onboarding flow for Image & Video feature')" in source
+    for text in ('Switch seamlessly between Image and Video', 'Access to popular models in one click',
+                 'Upscale, Lip Sync and more all in the same flow'):
+        assert 'includes(' + repr(text) + ')' in source
+    assert "buttons.length===1&&text(buttons[0])==='Get started'" in source
+
+
 def test_known_welcome_scrolls_then_rechecks_close_before_clicking(clock, monkeypatch):
     page = CapturedOnboarding()
     prior_view, prior_click = page._onboarding_view, page.click

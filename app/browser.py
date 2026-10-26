@@ -65,6 +65,21 @@ const creatorWelcome=root=>root?.getAttribute('role')==='dialog'&&
     return heading&&root.contains(heading)&&heading.tagName==='H2'&&text(heading)==='Welcome to ElevenLabs Creator';
   })&&text(root).includes('Overview of your subscription benefits')&&text(root).includes('Included in your plan');
 '''
+_IMAGE_VIDEO_INTRO_DOM = r'''
+const imageVideoIntro=root=>{
+  if(root?.getAttribute('role')!=='dialog')return false;
+  const reference=(attribute,tag,expected)=>(root.getAttribute(attribute)||'').split(/\s+/).some(id=>{
+    const e=document.getElementById(id);return e&&root.contains(e)&&e.tagName===tag&&text(e)===expected;
+  });
+  const buttons=[...root.querySelectorAll('button')].filter(rendered);
+  return reference('aria-labelledby','H3','Introducing Image & Video')&&
+    reference('aria-describedby','P','Onboarding flow for Image & Video feature')&&
+    text(root).includes('Switch seamlessly between Image and Video')&&
+    text(root).includes('Access to popular models in one click')&&
+    text(root).includes('Upscale, Lip Sync and more all in the same flow')&&
+    buttons.length===1&&text(buttons[0])==='Get started';
+};
+'''
 
 
 class BrowserError(Exception):
@@ -534,7 +549,7 @@ class CDPBrowser:
                 self.timeout = previous_timeout
 
     def _onboarding_view(self) -> dict[str, Any]:
-        expression = r'''(()=>{VISIBLE WELCOME
+        expression = r'''(()=>{VISIBLE WELCOME INTRO
           if(challengeOverlay)return {stage:'captcha',controls:{}};
           const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].filter(visible);
           const root=dialogs.at(-1)||document.querySelector('main')||document.body;
@@ -545,6 +560,9 @@ class CDPBrowser:
           if(creatorWelcome(root)){
             const close=[...root.querySelectorAll('button')].find(e=>rendered(e)&&text(e)==='Close');
             add('close',close);return {stage:'creator-welcome',controls,needs_scroll:!!close&&!controls.close};
+          }
+          if(imageVideoIntro(root)){
+            add('get-started',exact(/^Get started$/,'button'));return {stage:'image-video-intro',controls};
           }
           const platform=find(root,'[data-agent-id="onboarding-platform-elevencreative"],button[aria-label="ElevenCreative"]');
           if(platform){add('platform',platform);add('next',next(root));return {stage:'platform',controls};}
@@ -588,7 +606,7 @@ class CDPBrowser:
           if(pricing){add('skip',exact(/^skip$/i,'button'));return {stage:'pricing',controls};}
           if(document.readyState==='loading'||!document.body?.innerText?.trim())return {stage:'loading',controls};
           return {stage:dialogs.length?'unknown-dialog':'waiting',onboarding_path:location.pathname==='/app/onboarding',controls};
-        })()'''.replace("VISIBLE", _VISIBLE_DOM).replace("WELCOME", _CREATOR_WELCOME_DOM)
+        })()'''.replace("VISIBLE", _VISIBLE_DOM).replace("WELCOME", _CREATOR_WELCOME_DOM).replace("INTRO", _IMAGE_VIDEO_INTRO_DOM)
         result = self.evaluate(expression)
         if not isinstance(result, dict):
             raise BrowserError("onboarding page is still initializing")
@@ -672,11 +690,13 @@ class CDPBrowser:
                         choice = "skip"  # No plan, trial, purchase or upgrade action exists here.
                     elif stage == "creator-welcome":
                         choice = "close"  # Captured subscription-benefits notice; no 2FA action.
+                    elif stage == "image-video-intro":
+                        choice = "get-started"  # Exact feature-introduction notice, never model approval.
                     action = controls.get(choice) if choice else None
                     key = (str(stage), str(choice))
                     if action and (key != last_action or choice in {"adult", "terms", "updated"}):
                         self.click(float(action["x"]), float(action["y"]))
-                        if stage != "creator-welcome":
+                        if stage not in {"creator-welcome", "image-video-intro"}:
                             acted_in_flow = True
                         last_action = key
                         unknown_since = None
@@ -702,7 +722,7 @@ class CDPBrowser:
                 with self._ui_step():
                     final_view = self._onboarding_view()
                 if (final_view.get("stage") in {"loading", "platform", "personal-info", "persona",
-                                               "persona-details", "interests", "pricing", "creator-welcome"}
+                                               "persona-details", "interests", "pricing", "creator-welcome", "image-video-intro"}
                         and not final_view.get("blocked_controls")):
                     raise BrowserError("ONBOARDING_NETWORK_ERROR: authorized website verification is temporarily unavailable")
             except BrowserRejected:
