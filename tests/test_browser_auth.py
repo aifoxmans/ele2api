@@ -134,7 +134,8 @@ def test_login_fills_both_standard_fields_and_submits_once(monkeypatch):
     monkeypatch.setattr('app.browser.time.sleep', lambda seconds: None)
     result = browser.login_with_password('person@example.test', 'private-password')
     assert result['access_token'] == expected
-    assert navigation == [('Page.navigate', {'url': 'https://elevenlabs.io/app/sign-in'})]
+    assert navigation == [('Page.navigate', {'url': 'https://elevenlabs.io/app/sign-in'}),
+                          ('Page.bringToFront',)]
     assert len(submitted) == 1
     assert [text for _, text in filled] == ['person@example.test', 'private-password']
 

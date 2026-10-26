@@ -34,14 +34,47 @@ MAX_LOGIN_JOBS = 100
 logger = logging.getLogger(__name__)
 
 
-def account_login_failure(error: Exception) -> tuple[str, str]:
+def account_login_failure(error: Exception, *, phase: str = "") -> tuple[str, str]:
     """Keep account diagnostics useful without publishing private browser data."""
     reason = str(error).upper()
     if "CAPTCHA_REQUIRED" in reason:
         return "verification_required", "网站需要人工验证，请打开网页登录完成验证"
+    if reason.startswith("ONBOARDING_LOADING_TIMEOUT"):
+        return "onboarding_required", "已登录，年龄确认或偏好页面加载超时，请稍后重试或打开网页登录继续"
+    if reason.startswith("ONBOARDING_NETWORK_ERROR"):
+        return "network_error", "已登录，年龄确认或偏好设置连接上游失败，请稍后重试"
     if "ONBOARDING_REQUIRED" in reason:
-        return "onboarding_required", "登录后设置尚未完成，请重试完成年龄确认和偏好设置"
+        return "onboarding_required", "已登录，年龄确认或偏好设置未完成，请打开网页登录检查当前步骤"
+    if reason.startswith("LOGIN_LOADING_TIMEOUT"):
+        return "network_error", "登录页面加载超时，请稍后重试自动登录"
+    if reason.startswith("LOGIN_NETWORK_ERROR"):
+        return "network_error", "登录页面连接上游失败，请稍后重试自动登录"
+    if "BROWSER IDENTITY DIFFERS" in reason:
+        return "login_required", "浏览器登录账号与导入邮箱不一致，请核对账号后重试"
+    if reason.startswith(("LOGIN_INVALID_CREDENTIALS", "LOGIN_CREDENTIALS_REJECTED")):
+        return "login_required", "邮箱或密码被网站拒绝，请检查后重试"
+    if "LOGIN_FAILED: THE WEBSITE REJECTED" in reason:
+        return "login_required", "网站拒绝了本次登录，请检查邮箱密码或打开网页登录验证"
+    if reason.startswith("LOGIN_REQUIRED"):
+        return "login_required", "登录会话尚未就绪或已失效，请重新登录"
+    if "ACCOUNT PROXY MUST BE" in reason or "CONFIGURE AN ACCOUNT PROXY" in reason:
+        return "network_error", "账号代理配置无效，请检查代理地址后重试"
+    if phase == "browser_start" and not isinstance(error, BrowserRejected):
+        return "network_error", "浏览器初始化未完成，请稍后重试自动登录"
+    if reason.startswith("LOGIN_FAILED"):
+        return "login_required", "登录表单尚未完成或未获得会话，请打开网页登录检查"
     return "login_required", "登录验证未完成，请重试自动登录或完成网页登录"
+
+
+def _retryable_login_browser_start(error: BrowserError) -> bool:
+    """Only startup/network failures before any credentials were entered."""
+    if isinstance(error, BrowserRejected):
+        return False
+    reason = str(error)
+    return (reason.startswith(("BROWSER_INITIALIZING", "BROWSER_STARTUP_TIMEOUT", "BROWSER_NETWORK_ERROR"))
+            or "managed ElevenLabs Chrome did not start" in reason
+            or "account browser is still initializing" in reason
+            or bool(re.match(r"ElevenLabs CDP port \d+ is unavailable:", reason)))
 
 
 class AccountCreditRejected(Exception):
@@ -260,7 +293,7 @@ class Service:
                 raise ValueError("saved login email and password are required")
             if not account["proxy_url"]:
                 raise ValueError("account proxy is required")
-            result = {"account_id": account_id, "status": "queued", "message": "已加入自动登录队列",
+            result = {"account_id": account_id, "status": "queued", "phase": "queued", "message": "已加入自动登录队列",
                       "updated_at": time.time()}
             self._login_results[account_id] = result
             self._login_pending.add(account_id)
@@ -275,6 +308,8 @@ class Service:
 
     def _run_account_login(self, account_id: int) -> None:
         account, owned = None, False
+        phase = "browser_start"
+        browser_attempts = onboarding_resumes = 0
         try:
             if self._stop.is_set():
                 raise BrowserError("automatic login stopped")
@@ -283,16 +318,51 @@ class Service:
                 raise KeyError(account_id)
             # Acquire before logging_in; the normal runtime protects that state
             # against competing manual login and generation operations.
-            account, owned = self.browser_runtime.acquire(account, force_managed=True)
-            self.store.update_account(account_id, {"status": "logging_in"})
             with self._lock:
-                self._login_results[account_id].update(status="running", message="正在网页登录并自动完成年龄确认和偏好设置", updated_at=time.time())
-            auth = CDPBrowser(int(account["cdp_port"])).login_with_password(
-                str(account["login_email"]), str(account["login_password"]))
+                self._login_results[account_id].update(status="running", phase=phase,
+                    message="正在初始化账号浏览器", updated_at=time.time())
+            for attempt in range(2):
+                browser_attempts += 1
+                try:
+                    account, owned = self.browser_runtime.acquire(account, force_managed=True)
+                    break
+                except BrowserError as error:
+                    if attempt or not _retryable_login_browser_start(error):
+                        raise
+                    with self._lock:
+                        self._login_results[account_id].update(
+                            phase=phase, message="浏览器暂未就绪，稍后进行最后一次初始化检查", updated_at=time.time())
+                    if self._stop.wait(2):
+                        raise BrowserError("automatic login stopped") from error
+            self.store.update_account(account_id, {"status": "logging_in"})
+            phase = "login"
+            with self._lock:
+                self._login_results[account_id].update(status="running", phase=phase,
+                    message="正在网页登录并自动完成年龄确认和偏好设置", updated_at=time.time())
+            browser = CDPBrowser(int(account["cdp_port"]))
+            try:
+                auth = browser.login_with_password(str(account["login_email"]), str(account["login_password"]))
+            except BrowserError as error:
+                if not str(error).startswith(("ONBOARDING_LOADING_TIMEOUT:", "ONBOARDING_NETWORK_ERROR:")):
+                    raise
+                # These markers explicitly establish a signed-in profile and a
+                # transient setup failure. Resume only setup, never sign-in.
+                phase = "onboarding"
+                with self._lock:
+                    self._login_results[account_id].update(phase=phase,
+                        message="已登录，年龄或偏好页面暂未就绪，稍后继续一次", updated_at=time.time())
+                if self._stop.wait(2):
+                    raise BrowserError("automatic login stopped") from error
+                onboarding_resumes = 1
+                auth = browser.complete_onboarding(expected_email=str(account["login_email"]))
             if not auth.get("access_token"):
                 raise BrowserRejected("LOGIN_FAILED")
             self.store.update_account(account_id, {key: auth[key] for key in ACCOUNT_AUTH_FIELDS if key in auth})
             self.store.clear_media_cache(account_id)
+            phase = "account_verification"
+            with self._lock:
+                self._login_results[account_id].update(phase=phase,
+                    message="正在确认服务端登录设置与额度", updated_at=time.time())
             checked = self._check_account_live(self.store.account(account_id, private=True), login_owner=True)
             if checked["status"] not in {"active", "disabled_low_balance"}:
                 status = checked["status"]
@@ -301,10 +371,13 @@ class Service:
             if checked["status"] == "active":
                 self.store.update_account(account_id, {"enabled": True})
             status = checked["status"]
+            phase = "complete"
             message = ("登录、年龄确认、偏好设置及额度验证成功" if status == "active"
                        else "登录及年龄偏好设置完成，余额低于停用阈值")
         except Exception as error:
-            status, message = account_login_failure(error)
+            if str(error).startswith("ONBOARDING_"):
+                phase = "onboarding"
+            status, message = account_login_failure(error, phase=phase)
             if self.store.account(account_id):
                 self.store.update_account(account_id, {"status": status, "last_error": message, "enabled": False})
         finally:
@@ -314,6 +387,7 @@ class Service:
                 self._login_pending.discard(account_id)
                 self._login_results.setdefault(account_id, {"account_id": account_id}).update(
                     status=locals().get("status", "login_required"),
+                    phase=phase, browser_attempts=browser_attempts, onboarding_resume_attempts=onboarding_resumes,
                     message=locals().get("message", "自动登录未完成，请重试或使用网页登录"), updated_at=time.time())
 
     def batch_import(self, text: str) -> dict[str, Any]:

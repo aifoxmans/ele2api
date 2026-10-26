@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ GENERATION_SITEKEY = "a672bccc-8364-4300-8fe6-840a693c087a"
 _PROCESS_LOCK = threading.RLock()
 _PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 _CAPTCHA_LOCKS: dict[int, threading.RLock] = {}
+_UI_LOCK = threading.RLock()
 _VISIBLE_DOM = r'''
 const rendered=e=>{
   if(!e||e.disabled||e.getAttribute('aria-disabled')==='true')return false;
@@ -171,7 +173,9 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
     profile.mkdir(parents=True, exist_ok=True)
     args = [chrome, f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1", "--no-first-run",
-            "--no-default-browser-check", "--password-store=basic", "--window-size=1280,960"]
+            "--no-default-browser-check", "--password-store=basic", "--window-size=1280,960",
+            "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding"]
     if os.name != "nt":
         args += ["--no-sandbox", "--disable-dev-shm-usage"]
     proxy_url = account_proxy_url(account)
@@ -515,6 +519,20 @@ class CDPBrowser:
             raise BrowserError("onboarding verification is temporarily unavailable")
         return result.get("complete") is True
 
+    @contextmanager
+    def _ui_step(self):
+        # Separate profiles share one desktop. Only the brief visible DOM action
+        # owns focus; authentication HTTP checks and polling never hold this lock.
+        with _UI_LOCK:
+            previous_timeout = self.timeout
+            try:
+                self.timeout = min(previous_timeout, 5)
+                self.command("Page.bringToFront")
+                time.sleep(.25)  # Allow the website's normal 200ms entrance animation.
+                yield
+            finally:
+                self.timeout = previous_timeout
+
     def _onboarding_view(self) -> dict[str, Any]:
         expression = r'''(()=>{VISIBLE WELCOME
           if(challengeOverlay)return {stage:'captcha',controls:{}};
@@ -568,6 +586,7 @@ class CDPBrowser:
             (/choose.{0,24}plan|pick.{0,24}plan|pricing|upgrade.{0,24}plan|select.{0,24}plan|creator is the best way to get started|pay as you go on the creator plan/i.test(text(e))||
              /^onboarding-pricing/.test(e.getAttribute('data-agent-id')||'')));
           if(pricing){add('skip',exact(/^skip$/i,'button'));return {stage:'pricing',controls};}
+          if(document.readyState==='loading'||!document.body?.innerText?.trim())return {stage:'loading',controls};
           return {stage:dialogs.length?'unknown-dialog':'waiting',onboarding_path:location.pathname==='/app/onboarding',controls};
         })()'''.replace("VISIBLE", _VISIBLE_DOM).replace("WELCOME", _CREATOR_WELCOME_DOM)
         result = self.evaluate(expression)
@@ -597,6 +616,8 @@ class CDPBrowser:
         unknown_since: float | None = None
         entered_onboarding = False
         welcome_scrolls = 0
+        last_stage = None
+        browser_failed = False
         while time.monotonic() < deadline:
             try:
                 current = self.collect_auth()
@@ -609,64 +630,86 @@ class CDPBrowser:
                     if self._onboarding_complete_on_server(auth):
                         return auth
                     next_verify = time.monotonic() + 1.5
-                view = self._onboarding_view()
-                stage, controls = view.get("stage"), view.get("controls") or {}
-                if stage == "captcha":
-                    raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
-                if stage == "creator-welcome" and view.get("needs_scroll") and welcome_scrolls < 2:
-                    welcome_scrolls += 1
-                    self._scroll_creator_welcome_close()
-                    time.sleep(.4)
-                    continue
-                if (stage == "waiting" and not view.get("onboarding_path") and not entered_onboarding
-                        and not acted_in_flow):
-                    # A saved local completion flag is not proof of server
-                    # readiness. Enter the website's ordinary captured flow.
-                    self.command("Page.navigate", {"url": BASE + "/app/onboarding"})
-                    entered_onboarding = True
-                    unknown_since = None
-                    time.sleep(.4)
-                    continue
-                choice = None
-                if stage == "platform":
-                    choice = "next" if controls.get("platform", {}).get("selected") else "platform"
-                elif stage == "personal-info":
-                    if view.get("blocked_controls"):
-                        choice = None  # Never submit before a named required control can be resolved.
-                    elif controls.get("updated", {}).get("selected"):
-                        choice = "updated"  # Opt out through the actual checkbox; never opt in.
-                    else:
-                        choice = next((key for key in ("adult", "terms")
-                                       if key in controls and not controls[key].get("selected")), "next")
-                elif stage in {"persona", "interests", "persona-details"}:
-                    keys = {"persona": ("creator",), "interests": ("image-video",),
-                            "persona-details": ("youtube", "shorts")}[stage]
-                    choice = next((key for key in keys if key in controls and not controls[key].get("selected")), "next")
-                    if choice == "next" and choice not in controls and stage == "persona-details":
-                        choice = "skip"
-                elif stage == "pricing":
-                    choice = "skip"  # No plan, trial, purchase or upgrade action exists here.
-                elif stage == "creator-welcome":
-                    choice = "close"  # Captured subscription-benefits notice; no 2FA action.
-                action = controls.get(choice) if choice else None
-                key = (str(stage), str(choice))
-                if action and (key != last_action or choice in {"adult", "terms", "updated"}):
-                    self.click(float(action["x"]), float(action["y"]))
-                    if stage != "creator-welcome":
-                        acted_in_flow = True
-                    last_action = key
-                    unknown_since = None
-                elif stage in {"unknown-dialog", "waiting"} or view.get("blocked_controls") or (choice and not action):
-                    if unknown_since is None:
-                        unknown_since = time.monotonic()
-                    if time.monotonic() - unknown_since >= 6:
-                        raise BrowserRejected("ONBOARDING_REQUIRED: an unknown or incomplete website step needs review")
+                with self._ui_step():
+                    view = self._onboarding_view()
+                    stage, controls = view.get("stage"), view.get("controls") or {}
+                    last_stage = stage
+                    browser_failed = False
+                    if stage == "captcha":
+                        raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
+                    if stage == "creator-welcome" and view.get("needs_scroll") and welcome_scrolls < 2:
+                        welcome_scrolls += 1
+                        self._scroll_creator_welcome_close()
+                        time.sleep(.4)
+                        continue
+                    if (stage == "waiting" and not view.get("onboarding_path") and not entered_onboarding
+                            and not acted_in_flow):
+                        # A saved local completion flag is not proof of server
+                        # readiness. Enter the website's ordinary captured flow.
+                        self.command("Page.navigate", {"url": BASE + "/app/onboarding"})
+                        entered_onboarding = True
+                        unknown_since = None
+                        time.sleep(.4)
+                        continue
+                    choice = None
+                    if stage == "platform":
+                        choice = "next" if controls.get("platform", {}).get("selected") else "platform"
+                    elif stage == "personal-info":
+                        if view.get("blocked_controls"):
+                            choice = None  # Never submit before a named required control can be resolved.
+                        elif controls.get("updated", {}).get("selected"):
+                            choice = "updated"  # Opt out through the actual checkbox; never opt in.
+                        else:
+                            choice = next((key for key in ("adult", "terms")
+                                           if key in controls and not controls[key].get("selected")), "next")
+                    elif stage in {"persona", "interests", "persona-details"}:
+                        keys = {"persona": ("creator",), "interests": ("image-video",),
+                                "persona-details": ("youtube", "shorts")}[stage]
+                        choice = next((key for key in keys if key in controls and not controls[key].get("selected")), "next")
+                        if choice == "next" and choice not in controls and stage == "persona-details":
+                            choice = "skip"
+                    elif stage == "pricing":
+                        choice = "skip"  # No plan, trial, purchase or upgrade action exists here.
+                    elif stage == "creator-welcome":
+                        choice = "close"  # Captured subscription-benefits notice; no 2FA action.
+                    action = controls.get(choice) if choice else None
+                    key = (str(stage), str(choice))
+                    if action and (key != last_action or choice in {"adult", "terms", "updated"}):
+                        self.click(float(action["x"]), float(action["y"]))
+                        if stage != "creator-welcome":
+                            acted_in_flow = True
+                        last_action = key
+                        unknown_since = None
+                    elif stage in {"unknown-dialog", "waiting"} or view.get("blocked_controls") or (choice and not action):
+                        if unknown_since is None:
+                            unknown_since = time.monotonic()
+                        if time.monotonic() - unknown_since >= 6:
+                            raise BrowserRejected("ONBOARDING_REQUIRED: an unknown or incomplete website step needs review")
                 time.sleep(.4)
             except BrowserRejected:
                 raise
             except BrowserError:
                 # Navigation, hydration and the final normal save are asynchronous.
+                browser_failed = True
                 time.sleep(.4)
+        if last_stage == "loading" and not browser_failed:
+            raise BrowserRejected("ONBOARDING_LOADING_TIMEOUT: the authorized website is still loading")
+        if browser_failed:
+            # Retry permission needs a current, ordinary page with no unknown
+            # dialog or unresolved required control; a network error alone is
+            # insufficient evidence that the UI is safe to resume.
+            try:
+                with self._ui_step():
+                    final_view = self._onboarding_view()
+                if (final_view.get("stage") in {"loading", "platform", "personal-info", "persona",
+                                               "persona-details", "interests", "pricing", "creator-welcome"}
+                        and not final_view.get("blocked_controls")):
+                    raise BrowserError("ONBOARDING_NETWORK_ERROR: authorized website verification is temporarily unavailable")
+            except BrowserRejected:
+                raise
+            except BrowserError as exc:
+                if str(exc).startswith("ONBOARDING_NETWORK_ERROR:"):
+                    raise
         raise BrowserRejected("ONBOARDING_REQUIRED: normal website onboarding did not finish within its time limit")
 
     def login_with_password(self, email: str, password: str) -> dict[str, Any]:
@@ -687,25 +730,26 @@ class CDPBrowser:
                         time.sleep(.3)
                         continue
                     loader_id = None
-                state = self._login_form_state(email, password)
-                if state.get("login_error"):
-                    raise BrowserRejected("LOGIN_FAILED: the website rejected the ordinary sign-in")
-                if state.get("challenge_overlay"):
-                    raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
-                if state.get("email_present") and not state.get("email_matches"):
-                    self._fill_login_field('input[type="email"],input[name="email"],input[autocomplete="email"]', email)
-                if state.get("password_present") and not state.get("password_matches"):
-                    self._fill_login_field('input[type="password"]', password)
-                state = self._login_form_state(email, password)
-                stage = "password" if state.get("password_present") else "email"
-                valid = (state.get("password_valid") and (state.get("email_valid") or not state.get("email_present"))
-                         if stage == "password" else state.get("email_valid"))
-                key = (state.get("document_id"), stage)
-                if valid and state.get("submit_enabled") and key not in submitted:
-                    if self._click_login_submit():
-                        submitted.add(key)
-                elif valid and state.get("challenge_widget") and not state.get("submit_enabled"):
-                    raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
+                with self._ui_step():
+                    state = self._login_form_state(email, password)
+                    if state.get("login_error"):
+                        raise BrowserRejected("LOGIN_FAILED: the website rejected the ordinary sign-in")
+                    if state.get("challenge_overlay"):
+                        raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
+                    if state.get("email_present") and not state.get("email_matches"):
+                        self._fill_login_field('input[type="email"],input[name="email"],input[autocomplete="email"]', email)
+                    if state.get("password_present") and not state.get("password_matches"):
+                        self._fill_login_field('input[type="password"]', password)
+                    state = self._login_form_state(email, password)
+                    stage = "password" if state.get("password_present") else "email"
+                    valid = (state.get("password_valid") and (state.get("email_valid") or not state.get("email_present"))
+                             if stage == "password" else state.get("email_valid"))
+                    key = (state.get("document_id"), stage)
+                    if valid and state.get("submit_enabled") and key not in submitted:
+                        if self._click_login_submit():
+                            submitted.add(key)
+                    elif valid and state.get("challenge_widget") and not state.get("submit_enabled"):
+                        raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
             except BrowserRejected:
                 raise
             except BrowserError:

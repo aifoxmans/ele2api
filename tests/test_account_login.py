@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.browser import BrowserError, BrowserRejected
-from app.service import Service
+from app.service import Service, account_login_failure
 from app.store import Store
 
 
@@ -293,3 +293,130 @@ def test_automatic_login_result_explains_completed_age_and_preferences(account_s
     assert service.login_results()[0]["status"] == "active"
     assert "年龄确认" in service.login_results()[0]["message"]
     assert "偏好设置" in service.login_results()[0]["message"]
+
+
+@pytest.fixture
+def automatic_account(account_service, monkeypatch):
+    service, account_id, events, client = account_service
+    service.store.update_account(account_id, {"status": "login_pending", "enabled": False})
+    service._login_pending.add(account_id)
+    service._login_results[account_id] = {"account_id": account_id}
+    monkeypatch.setattr(service._stop, "wait", lambda timeout: False)
+    return service, account_id, events, client
+
+
+@pytest.mark.parametrize("marker", ["ONBOARDING_LOADING_TIMEOUT", "ONBOARDING_NETWORK_ERROR"])
+def test_transient_setup_resume_never_replays_password_login(automatic_account, monkeypatch, marker):
+    service, account_id, _, _ = automatic_account
+    calls = []
+
+    def login(*args):
+        calls.append("login")
+        raise BrowserRejected(marker + ": private-detail")
+
+    def complete(**kwargs):
+        calls.append("complete")
+        assert kwargs == {"expected_email": "person@example.test"}
+        return {"access_token": "verified-private-access"}
+
+    monkeypatch.setattr("app.service.CDPBrowser", lambda *args: SimpleNamespace(
+        login_with_password=login, complete_onboarding=complete))
+    service._run_account_login(account_id)
+    assert calls == ["login", "complete"]
+    assert service.store.account(account_id)["status"] == "active"
+    result = service.login_results()[0]
+    assert result["onboarding_resume_attempts"] == 1 and result["phase"] == "complete"
+
+
+def test_setup_resume_stops_after_one_extra_attempt(automatic_account, monkeypatch):
+    service, account_id, _, _ = automatic_account
+    calls = []
+
+    def fail(stage):
+        calls.append(stage)
+        raise BrowserError("ONBOARDING_NETWORK_ERROR: private-cookie private-password")
+
+    monkeypatch.setattr("app.service.CDPBrowser", lambda *args: SimpleNamespace(
+        login_with_password=lambda *args: fail("login"), complete_onboarding=lambda **kwargs: fail("complete")))
+    service._run_account_login(account_id)
+    result = service.store.account(account_id)
+    assert calls == ["login", "complete"]
+    assert result["status"] == "network_error" and not result["enabled"]
+    assert "已登录" in result["last_error"] and "private-" not in result["last_error"]
+    assert service.login_results()[0]["phase"] == "onboarding"
+
+
+@pytest.mark.parametrize("marker", [
+    "ONBOARDING_REQUIRED", "CAPTCHA_REQUIRED", "LOGIN_INVALID_CREDENTIALS",
+    "LOGIN_FAILED", "LOGIN_LOADING_TIMEOUT", "LOGIN_NETWORK_ERROR",
+])
+def test_unconfirmed_or_definitive_login_failures_never_replay_credentials(automatic_account, monkeypatch, marker):
+    service, account_id, _, _ = automatic_account
+    calls = []
+
+    def login(*args):
+        calls.append("login")
+        raise BrowserRejected(marker + ": private-cookie private-password")
+
+    monkeypatch.setattr("app.service.CDPBrowser", lambda *args: SimpleNamespace(
+        login_with_password=login, complete_onboarding=lambda **kwargs: pytest.fail("must not resume this failure")))
+    service._run_account_login(account_id)
+    result = service.store.account(account_id)
+    assert calls == ["login"] and not result["enabled"]
+    assert "private-" not in result["last_error"]
+    assert service.login_results()[0]["onboarding_resume_attempts"] == 0
+
+
+def test_browser_initialization_retries_before_password_submission_only(automatic_account, monkeypatch):
+    service, account_id, _, _ = automatic_account
+    calls = []
+
+    def acquire(account, **kwargs):
+        calls.append("acquire")
+        if calls == ["acquire"]:
+            raise BrowserError("ElevenLabs CDP port 19301 is unavailable: TimeoutError")
+        return {**account, "cdp_port": 19301}, True
+
+    monkeypatch.setattr(service.browser_runtime, "acquire", acquire)
+    monkeypatch.setattr("app.service.CDPBrowser", lambda *args: SimpleNamespace(
+        login_with_password=lambda *args: calls.append("login") or {"access_token": "verified-private-access"}))
+    service._run_account_login(account_id)
+    assert calls == ["acquire", "acquire", "login"]
+    assert service.login_results()[0]["browser_attempts"] == 2
+    assert service.store.account(account_id)["status"] == "active"
+
+
+@pytest.mark.parametrize("failure,attempts,status", [
+    (BrowserError("managed ElevenLabs Chrome did not start"), 2, "network_error"),
+    (BrowserRejected("LOGIN_REQUIRED: private-token"), 1, "login_required"),
+    (BrowserError("account proxy must be a SOCKS5 or HTTP proxy with host and port"), 1, "network_error"),
+])
+def test_startup_failure_is_bounded_and_never_enters_login(automatic_account, monkeypatch, failure, attempts, status):
+    service, account_id, _, _ = automatic_account
+    calls = []
+
+    def acquire(*args, **kwargs):
+        calls.append("acquire")
+        raise failure
+
+    monkeypatch.setattr(service.browser_runtime, "acquire", acquire)
+    monkeypatch.setattr("app.service.CDPBrowser", lambda *args: pytest.fail("startup failed before login"))
+    service._run_account_login(account_id)
+    result = service.store.account(account_id)
+    assert calls == ["acquire"] * attempts and not result["enabled"]
+    assert result["status"] == status and "private-" not in result["last_error"]
+    assert service.login_results()[0]["phase"] == "browser_start"
+    assert service.login_results()[0]["browser_attempts"] == attempts
+
+
+@pytest.mark.parametrize("marker,phrase", [
+    ("ONBOARDING_LOADING_TIMEOUT", "页面加载超时"),
+    ("ONBOARDING_NETWORK_ERROR", "连接上游失败"),
+    ("ONBOARDING_REQUIRED", "当前步骤"),
+    ("LOGIN_LOADING_TIMEOUT", "登录页面加载超时"),
+    ("LOGIN_NETWORK_ERROR", "登录页面连接上游失败"),
+    ("LOGIN_INVALID_CREDENTIALS", "邮箱或密码"),
+])
+def test_login_diagnostics_preserve_failure_stage_without_private_prose(marker, phrase):
+    _, message = account_login_failure(BrowserRejected(marker + ": private-password private-token"))
+    assert phrase in message and "private-" not in message

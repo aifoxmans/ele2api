@@ -2,6 +2,7 @@
 
 import base64
 import json
+import threading
 
 import pytest
 
@@ -27,6 +28,7 @@ def clock(monkeypatch):
     value = Clock()
     monkeypatch.setattr('app.browser.time.monotonic', lambda: value.now)
     monkeypatch.setattr('app.browser.time.sleep', value.sleep)
+    monkeypatch.setattr(CDPBrowser, 'command', lambda *args, **kwargs: {})
     return value
 
 
@@ -51,6 +53,8 @@ class SignInPage(CDPBrowser):
         self.commands.append((method, params))
         if method == 'Page.navigate':
             return {'loaderId': 'sign-in-committed'}
+        if method == 'Page.bringToFront':
+            return {}
         assert method == 'Page.getFrameTree'
         if not self.committed:
             self.committed = True
@@ -352,7 +356,8 @@ def test_unknown_popup_or_visible_captcha_is_left_for_normal_verification(clock,
     monkeypatch.setattr(page, '_onboarding_complete_on_server', lambda value: False)
     monkeypatch.setattr(page, '_onboarding_view', lambda: {'stage': stage, 'controls': {}})
     monkeypatch.setattr(page, 'click', lambda *args: pytest.fail('unknown popup was clicked'))
-    monkeypatch.setattr(page, 'command', lambda *args: pytest.fail('unknown popup was bypassed by navigation'))
+    monkeypatch.setattr(page, 'command', lambda *args: {} if args[0] == 'Page.bringToFront' else
+                        pytest.fail('unknown popup was bypassed by navigation'))
     with pytest.raises(BrowserRejected, match=expected):
         page.complete_onboarding(auth(), expected_email=EMAIL)
 
@@ -367,7 +372,8 @@ def test_false_server_state_enters_captured_route_once_and_never_fakes_completio
     monkeypatch.setattr(page, 'click', lambda *args: pytest.fail('unrecognized page clicked'))
     with pytest.raises(BrowserRejected, match='ONBOARDING_REQUIRED'):
         page.complete_onboarding(auth(), expected_email=EMAIL)
-    assert commands == [('Page.navigate', {'url': BASE + '/app/onboarding'})]
+    assert [item for item in commands if item[0] == 'Page.navigate'] == [
+        ('Page.navigate', {'url': BASE + '/app/onboarding'})]
 
 
 def test_end_save_delay_waits_for_server_instead_of_restarting_flow(clock, monkeypatch):
@@ -387,7 +393,8 @@ def test_end_save_delay_waits_for_server_instead_of_restarting_flow(clock, monke
 
     monkeypatch.setattr(page, '_onboarding_view', view)
     monkeypatch.setattr(page, '_onboarding_complete_on_server', ready)
-    monkeypatch.setattr(page, 'command', lambda *args: pytest.fail('normal save delay restarted onboarding'))
+    monkeypatch.setattr(page, 'command', lambda *args: {} if args[0] == 'Page.bringToFront' else
+                        pytest.fail('normal save delay restarted onboarding'))
     assert page.complete_onboarding(auth(), expected_email=EMAIL) == auth()
     assert saved_at and clock.now - saved_at[0] > 2
 
@@ -434,3 +441,90 @@ def test_dom_probe_requires_visible_controls_and_never_writes_age_or_completion(
     assert "input#firstname" in source and "input#source-freetext" in source
     assert "h1,h2,h3,p,[data-agent-id]" in source
     assert all(word not in source for word in ['.click()', 'localStorage', 'birthday', 'fetch(', 'setItem'])
+
+
+def test_activation_precedes_ui_and_network_verification_does_not_hold_ui_lock(clock, monkeypatch):
+    from app.browser import _UI_LOCK
+    page = CDPBrowser(12345)
+    active, ready = [], []
+    monkeypatch.setattr(page, 'collect_auth', auth)
+    monkeypatch.setattr(page, 'command', lambda method, *args: active.append(method) or {})
+
+    def server(account_auth):
+        assert page.timeout == 90
+        acquired = threading.Event()
+        def probe():
+            with _UI_LOCK:
+                acquired.set()
+        thread = threading.Thread(target=probe)
+        thread.start()
+        assert acquired.wait(.5), 'network verification held the global UI lock'
+        thread.join()
+        return bool(ready)
+
+    def view():
+        assert active[-1] == 'Page.bringToFront' and page.timeout == 5
+        return {'stage': 'platform', 'controls': {
+            'platform': {'selected': True}, 'next': {'x': 1, 'y': 2}}}
+
+    monkeypatch.setattr(page, '_onboarding_complete_on_server', server)
+    monkeypatch.setattr(page, '_onboarding_view', view)
+    monkeypatch.setattr(page, 'click', lambda *args: ready.append(True))
+    assert page.complete_onboarding(auth(), expected_email=EMAIL) == auth()
+    assert ready == [True] and page.timeout == 90
+
+
+def test_focus_steps_are_serialized_and_restore_ui_timeout_after_error(monkeypatch):
+    first, second = CDPBrowser(11111), CDPBrowser(22222)
+    entered, release, other_entered = threading.Event(), threading.Event(), threading.Event()
+    monkeypatch.setattr('app.browser.time.sleep', lambda seconds: None)
+    monkeypatch.setattr(CDPBrowser, 'command', lambda *args, **kwargs: {})
+
+    def one():
+        with first._ui_step():
+            entered.set()
+            assert release.wait(2)
+
+    def two():
+        with second._ui_step():
+            other_entered.set()
+
+    a = threading.Thread(target=one)
+    b = threading.Thread(target=two)
+    a.start()
+    assert entered.wait(1)
+    b.start()
+    assert not other_entered.wait(.05), 'another account stole focus during a UI action'
+    release.set()
+    a.join(2)
+    b.join(2)
+    assert not a.is_alive() and not b.is_alive() and other_entered.is_set()
+    with pytest.raises(ValueError):
+        with first._ui_step():
+            assert first.timeout == 5
+            raise ValueError('synthetic DOM error')
+    assert first.timeout == second.timeout == 90
+
+
+def test_loading_timeout_is_distinct_from_unknown_dialog(clock, monkeypatch):
+    page = CDPBrowser(12345)
+    monkeypatch.setattr(page, 'collect_auth', auth)
+    monkeypatch.setattr(page, '_onboarding_complete_on_server', lambda account_auth: False)
+    monkeypatch.setattr(page, '_onboarding_view', lambda: {'stage': 'loading', 'controls': {}})
+    monkeypatch.setattr(page, 'click', lambda *args: pytest.fail('loading page was clicked'))
+    with pytest.raises(BrowserRejected, match='^ONBOARDING_LOADING_TIMEOUT:'):
+        page.complete_onboarding(auth(), expected_email=EMAIL)
+
+
+@pytest.mark.parametrize('stage,marker', [('platform', 'ONBOARDING_NETWORK_ERROR'),
+                                         ('unknown-dialog', 'ONBOARDING_REQUIRED')])
+def test_network_resume_marker_requires_current_safe_page(clock, monkeypatch, stage, marker):
+    page = CDPBrowser(12345)
+    monkeypatch.setattr(page, 'collect_auth', auth)
+    def unavailable(account_auth):
+        raise BrowserError('synthetic verification transport failure')
+    monkeypatch.setattr(page, '_onboarding_complete_on_server', unavailable)
+    monkeypatch.setattr(page, '_onboarding_view', lambda: {'stage': stage, 'controls': {}})
+    monkeypatch.setattr(page, 'click', lambda *args: pytest.fail('network failure clicked UI'))
+    with pytest.raises(BrowserError, match='^' + marker + ':'):
+        page.complete_onboarding(auth(), expected_email=EMAIL)
