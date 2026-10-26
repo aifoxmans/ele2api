@@ -15,6 +15,9 @@ from urllib.parse import urlsplit
 import requests
 
 from .client import EleClient as UpstreamClient
+from .browser import BrowserRejected, CDPBrowser
+from .service import account_login_failure
+from .store import ACCOUNT_AUTH_FIELDS
 
 REQUIRES_PROJECT = False
 
@@ -271,7 +274,7 @@ class BrowserLoginManager:
                       "account_id": account_id, "desktop": desktop,
                       "previous": account, "new_desktop": account_id not in self.desktops,
                       "enable_after": bool(account["enabled"] or account["status"] in
-                                           {"pending", "login_required", "logging_in", "verification_required", "login_pending"}),
+                                            {"pending", "login_required", "logging_in", "verification_required", "onboarding_required", "login_pending"}),
                       "deadline": time.monotonic() + self.LEASE_SECONDS, "phase": "starting"}
             self.active = active
             try:
@@ -299,8 +302,17 @@ class BrowserLoginManager:
                 if not account:
                     raise LoginError("account no longer exists", 404)
                 temporary = {**account, "cdp_port": active["desktop"].cdp_port}
+                auth = await asyncio.to_thread(
+                    CDPBrowser(int(temporary["cdp_port"])).complete_onboarding,
+                    expected_email=str(account.get("login_email") or ""))
+                if not auth.get("access_token"):
+                    raise BrowserRejected("LOGIN_REQUIRED")
+                self.store.update_account(account_id, {key: auth[key] for key in ACCOUNT_AUTH_FIELDS if key in auth})
+                temporary.update(auth)
                 client = UpstreamClient(temporary, store=self.store)
                 try:
+                    if not await asyncio.to_thread(client.onboarding_complete):
+                        raise BrowserRejected("ONBOARDING_REQUIRED")
                     state = await asyncio.to_thread(client.account_state)
                 finally:
                     client.close()
@@ -326,7 +338,12 @@ class BrowserLoginManager:
                     active["phase"] = "login"
                 if isinstance(exc, LoginError):
                     raise
-                raise LoginError(f"browser login verification failed: {type(exc).__name__}", 409) from exc
+                status, message = account_login_failure(exc)
+                self.store.update_account(account_id, {"last_error": message, "enabled": False})
+                # Cancelling a failed verification must not resurrect an old
+                # active state after this profile proved to need login/setup.
+                active["previous"] = {**active.get("previous", {}), "enabled": False, "status": status}
+                raise LoginError(message, 409) from exc
 
     async def cancel(self, session_id: str) -> None:
         async with self.lock:

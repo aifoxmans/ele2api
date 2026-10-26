@@ -33,6 +33,9 @@ class Client:
     def account_state(self):
         return {"available_balance": 100, "buckets": {"remainPoints": 100}}
 
+    def onboarding_complete(self):
+        return True
+
     def close(self):
         pass
 

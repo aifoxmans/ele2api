@@ -366,7 +366,12 @@ def browser_action(account_id: int, body: dict[str, Any] = Body(...)) -> dict[st
 
 @app.post("/api/accounts/{account_id}/browser/complete", dependencies=[Depends(admin_auth)])
 def browser_complete(account_id: int) -> dict[str, Any]:
-    result = service.check_account(account_id)
+    try:
+        result = service.check_account(account_id, complete_onboarding=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="账号不存在") from exc
+    except BrowserError as exc:
+        raise HTTPException(status_code=409, detail="账号正在执行任务或登录，请完成后重试") from exc
     if result["status"] != "active":
         raise HTTPException(status_code=409, detail=result["last_error"] or "ElevenLabs login is incomplete")
     return result

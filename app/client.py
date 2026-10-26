@@ -142,6 +142,9 @@ class EleClient:
     def _save_auth(self, auth: dict[str, Any]) -> None:
         if not isinstance(auth, dict) or not isinstance(auth.get("access_token"), str) or not auth["access_token"].strip():
             return
+        expected_email = str(self.account.get("login_email") or "").strip()
+        if expected_email:
+            CDPBrowser._login_identity(auth, expected_email)
         fields = {key: auth[key] for key in ("access_token", "refresh_token", "firebase_api_key", "token_expires_at",
                                              "cookie", "user_agent") if key in auth}
         self.account.update(fields)
@@ -201,6 +204,11 @@ class EleClient:
             raise EleError("ElevenLabs credit balance was not returned; verify the login session")
         return {"available_balance": max(0.0, float(limit) - float(used)),
                 "buckets": {"used": used, "limit": limit, "tier": value.get("tier"), "status": value.get("status")}}
+
+    def onboarding_complete(self) -> bool:
+        """A valid subscription alone does not complete the website's setup."""
+        value = self.request("GET", "/v1/user/internal")
+        return value.get("is_onboarding_completed") is True
 
     verify = account_state
 

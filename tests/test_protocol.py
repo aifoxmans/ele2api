@@ -275,6 +275,49 @@ def test_empty_browser_auth_does_not_erase_valid_private_session():
     assert client.account["access_token"] == "synthetic-access"
 
 
+@pytest.mark.parametrize("response,ready", [
+    ({"is_onboarding_completed": True}, True), ({"is_onboarding_completed": False}, False),
+    ({}, False), ({"is_onboarding_completed": "true"}, False),
+    ({"is_onboarding_completed": 1}, False), ({"user": {"is_onboarding_completed": True}}, False),
+])
+def test_onboarding_readiness_requires_explicit_server_boolean(response, ready):
+    client = bare_client()
+    calls = []
+    client.request = lambda *args: calls.append(args) or response
+    assert client.onboarding_complete() is ready
+    assert calls == [("GET", "/v1/user/internal")]
+
+
+def test_wrong_browser_identity_is_rejected_before_account_or_store_changes():
+    import base64
+    import json
+
+    client = bare_client()
+    client.account["login_email"] = "person@example.test"
+    saved = []
+    client.store = SimpleNamespace(update_account=lambda *args: saved.append(args))
+    original = dict(client.account)
+    payload = base64.urlsafe_b64encode(json.dumps({"email": "other@example.test"}).encode()).decode().rstrip("=")
+    with pytest.raises(BrowserRejected, match="identity differs"):
+        client._save_auth({"access_token": "header." + payload + ".signature", "refresh_token": "private-other-refresh"})
+    assert client.account == original and not saved
+
+
+def test_matching_browser_identity_can_save_private_session_case_insensitively():
+    import base64
+    import json
+
+    client = bare_client()
+    client.account["login_email"] = "person@example.test"
+    saved = []
+    client.store = SimpleNamespace(update_account=lambda *args: saved.append(args))
+    payload = base64.urlsafe_b64encode(json.dumps({"email": "PERSON@example.test"}).encode()).decode().rstrip("=")
+    auth = {"access_token": "header." + payload + ".signature", "refresh_token": "private-new-refresh"}
+    client._save_auth(auth)
+    assert client.account["access_token"] == auth["access_token"]
+    assert saved == [(1, auth)]
+
+
 def test_stale_browser_token_falls_back_to_normal_firebase_refresh(monkeypatch):
     client = bare_client()
     client.account.update(token_expires_at=1, refresh_token="synthetic-refresh")

@@ -122,7 +122,7 @@ tbody tr:hover { background: rgba(85, 215, 173, .035); }
 .badge.active, .badge.succeeded { border-color: #2d8168; color: var(--mint); background: rgba(85,215,173,.07); }
 .badge.running, .badge.preparing, .badge.submitted, .badge.logging_in { border-color: #4d78a5; color: var(--blue); }
 .badge.failed, .badge.login_failed, .badge.login_required, .badge.verification_required, .badge.agreement_required, .badge.reauth_required, .badge.challenge_required, .badge.suspended { border-color: #984e4d; color: var(--red); }
-.badge.network_error, .badge.pending, .badge.login_pending, .badge.profile_resetting, .badge.queued { border-color: #8c753d; color: var(--yellow); }
+.badge.network_error, .badge.pending, .badge.login_pending, .badge.onboarding_required, .badge.profile_resetting, .badge.queued { border-color: #8c753d; color: var(--yellow); }
 .slots { display: inline-flex; align-items: center; gap: 5px; }
 .slots i { width: 6px; height: 6px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 8px rgba(85,215,173,.5); }
 .slots.busy i { background: var(--yellow); }

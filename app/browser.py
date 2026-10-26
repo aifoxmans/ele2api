@@ -24,6 +24,45 @@ GENERATION_SITEKEY = "a672bccc-8364-4300-8fe6-840a693c087a"
 _PROCESS_LOCK = threading.RLock()
 _PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 _CAPTCHA_LOCKS: dict[int, threading.RLock] = {}
+_VISIBLE_DOM = r'''
+const rendered=e=>{
+  if(!e||e.disabled||e.getAttribute('aria-disabled')==='true')return false;
+  for(let p=e;p&&p.nodeType===1;p=p.parentElement){
+    const s=getComputedStyle(p);
+    if(p.hidden||p.getAttribute('aria-hidden')==='true'||s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)return false;
+  }
+  const r=e.getBoundingClientRect();return r.width>1&&r.height>1;
+};
+const visible=e=>{
+  if(!rendered(e))return false;
+  const r=e.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2;
+  if(r.width<=1||r.height<=1||x<0||y<0||x>=innerWidth||y>=innerHeight)return false;
+  const top=document.elementFromPoint(x,y);
+  return !!top&&(e===top||e.contains(top)||top.contains(e));
+};
+const point=e=>{if(!visible(e))return null;const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};};
+const text=e=>(e?.innerText||e?.textContent||'').trim().replace(/\s+/g,' ');
+const find=(root,selector)=>[...root.querySelectorAll(selector)].find(visible);
+const checkedState=e=>!!e&&(e.checked===true||e.getAttribute('aria-checked')==='true'||e.getAttribute('aria-pressed')==='true'||
+  e.getAttribute('aria-selected')==='true'||['checked','on'].includes(e.getAttribute('data-state'))||
+  e.getAttribute('data-selected')==='true');
+const chosen=e=>!!e&&(checkedState(e)||checkedState(e.control)||
+  checkedState(e.htmlFor?document.getElementById(e.htmlFor):null)||
+  !!e.querySelector('input:checked,[role="checkbox"][aria-checked="true"],[role="radio"][aria-checked="true"]')||
+  (e.matches('[data-agent-id^="onboarding-illustration-option-"]')&&e.tabIndex===-1&&!!e.querySelector('.ring-2'))||
+  (e.matches('[data-agent-id^="onboarding-icon-option-"]')&&e.tabIndex===-1&&e.classList.contains('ring-2')));
+const challengeFrames=[...document.querySelectorAll('iframe')].filter(e=>
+  /hcaptcha\.com|recaptcha|challenges\.cloudflare\.com/i.test(e.src||'')&&visible(e));
+const challengeOverlay=challengeFrames.some(e=>e.getBoundingClientRect().height>110);
+const challengeWidget=challengeFrames.some(e=>{const r=e.getBoundingClientRect();return r.width>=180&&r.height>=45;});
+'''
+_CREATOR_WELCOME_DOM = r'''
+const creatorWelcome=root=>root?.getAttribute('role')==='dialog'&&
+  (root.getAttribute('aria-labelledby')||'').split(/\s+/).some(id=>{
+    const heading=document.getElementById(id);
+    return heading&&root.contains(heading)&&heading.tagName==='H2'&&text(heading)==='Welcome to ElevenLabs Creator';
+  })&&text(root).includes('Overview of your subscription benefits')&&text(root).includes('Included in your plan');
+'''
 
 
 class BrowserError(Exception):
@@ -384,9 +423,32 @@ class CDPBrowser:
         return token
 
     def _field(self, selector: str) -> dict[str, float] | None:
-        return self.evaluate("(()=>{const es=[...document.querySelectorAll(" + json.dumps(selector) + ")];"
-            "const e=es.find(e=>{const r=e.getBoundingClientRect();return r.width&&r.height&&!e.disabled;});"
-            "if(!e)return null;const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()")
+        return self.evaluate("(()=>{" + _VISIBLE_DOM + "return point(find(document," + json.dumps(selector) + "));})()")
+
+    def _login_form_state(self, email: str, password: str) -> dict[str, Any]:
+        # Values stay in this profile's execution context; only equality and
+        # validity booleans leave it. Recheck after every navigation/hydration.
+        expression = ("(()=>{const expectedEmail=" + json.dumps(email.strip()) + ";const expectedPassword=" +
+                      json.dumps(password) + ";" + _VISIBLE_DOM + r'''
+          const email=find(document,'input[type="email"],input[name="email"],input[autocomplete="email"]');
+          const password=find(document,'input[type="password"]');
+          const form=password?.closest('form')||email?.closest('form');
+          const buttons=form?[...form.querySelectorAll('button')].filter(e=>
+            /^(sign in|log in|login|continue|next|登录|登入|继续|下一步)$/i.test(text(e))):[];
+          const submit=buttons.find(visible);
+          const emailMatch=!!email&&email.value.trim().toLowerCase()===expectedEmail.toLowerCase();
+          const passwordMatch=!!password&&password.value===expectedPassword;
+          const alerts=[...document.querySelectorAll('[role="alert"]')].filter(visible);
+          return {document_id:String(performance.timeOrigin),email_present:!!email,password_present:!!password,
+            email_matches:emailMatch,password_matches:passwordMatch,
+            email_valid:emailMatch&&email.validity.valid,password_valid:passwordMatch&&password.validity.valid,
+            submit_enabled:!!submit,challenge_overlay:challengeOverlay,challenge_widget:challengeWidget,
+            login_error:alerts.some(e=>/invalid (email|password|credentials)|incorrect (email|password)|wrong password|too many (attempts|requests)/i.test(text(e)))};
+        })()''')
+        value = self.evaluate(expression)
+        if not isinstance(value, dict):
+            raise BrowserError("the sign-in form is still initializing")
+        return value
 
     def _fill_login_field(self, selector: str, text: str) -> bool:
         point = self._field(selector)
@@ -398,14 +460,16 @@ class CDPBrowser:
         self.command("Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2,
                                                  "windowsVirtualKeyCode": 65})
         self.command("Input.insertText", {"text": text})
-        return True
+        return bool(self.evaluate("(()=>{" + _VISIBLE_DOM + "const e=find(document," + json.dumps(selector)
+                                 + ");return !!e&&e.value===" + json.dumps(text) + ";})()"))
 
     def _click_login_submit(self) -> bool:
-        point = self.evaluate(r'''(()=>{
-          const visible=e=>{const r=e.getBoundingClientRect();return r.width&&r.height&&!e.disabled;};
-          const buttons=[...document.querySelectorAll('button[type="submit"],button')].filter(visible);
-          const e=buttons.find(e=>/^(sign in|log in|login|continue|登录|登入|继续)$/i.test(e.innerText.trim()));
-          if(!e)return null;const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()''')
+        point = self.evaluate(r'''(()=>{VISIBLE
+          const input=find(document,'input[type="password"]')||find(document,'input[type="email"],input[name="email"]');
+          const form=input?.closest('form');if(!form)return null;
+          return point([...form.querySelectorAll('button')].find(e=>visible(e)&&
+            /^(sign in|log in|login|continue|next|登录|登入|继续|下一步)$/i.test(text(e))));
+        })()'''.replace("VISIBLE", _VISIBLE_DOM))
         if point:
             self.click(point["x"], point["y"])
         return bool(point)
@@ -422,37 +486,232 @@ class CDPBrowser:
             raise BrowserRejected("LOGIN_FAILED: browser identity differs from the imported account")
         return auth
 
+    @staticmethod
+    def _auth_email(auth: dict[str, Any]) -> str:
+        try:
+            part = str(auth["access_token"]).split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+            return str(claims.get("email") or "").strip()
+        except (ValueError, IndexError, TypeError, KeyError):
+            return ""
+
+    def _onboarding_complete_on_server(self, auth: dict[str, Any]) -> bool:
+        expression = r'''(async()=>{
+          const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+          try{const response=await fetch(ENDPOINT,{method:'GET',credentials:'omit',signal:controller.signal,
+            headers:{Authorization:'Bearer '+TOKEN,Accept:'application/json'}});
+            if(response.status===401||response.status===403)return {http:response.status};
+            if(!response.ok)return {http:response.status};
+            const body=await response.json();return {http:response.status,complete:body.is_onboarding_completed===true};
+          }finally{clearTimeout(timer);}
+        })()'''.replace("ENDPOINT", json.dumps(API_BASE + "/v1/user/internal")).replace(
+            "TOKEN", json.dumps(str(auth.get("access_token") or "")))
+        result = self.evaluate(expression, await_promise=True)
+        if not isinstance(result, dict):
+            raise BrowserError("onboarding verification returned no response")
+        if result.get("http") in {401, 403}:
+            raise BrowserRejected("LOGIN_REQUIRED: website authorization needs renewal")
+        if result.get("http") != 200:
+            raise BrowserError("onboarding verification is temporarily unavailable")
+        return result.get("complete") is True
+
+    def _onboarding_view(self) -> dict[str, Any]:
+        expression = r'''(()=>{VISIBLE WELCOME
+          if(challengeOverlay)return {stage:'captcha',controls:{}};
+          const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].filter(visible);
+          const root=dialogs.at(-1)||document.querySelector('main')||document.body;
+          const controls={};
+          const add=(key,e)=>{const p=point(e);if(p)controls[key]={...p,selected:chosen(e)};};
+          const exact=(pattern,selector='button,label')=>[...root.querySelectorAll(selector)].find(e=>visible(e)&&pattern.test(text(e)));
+          const next=scope=>[...scope.querySelectorAll('button')].find(e=>visible(e)&&/^(next|continue|下一步|继续)$/i.test(text(e)));
+          if(creatorWelcome(root)){
+            const close=[...root.querySelectorAll('button')].find(e=>rendered(e)&&text(e)==='Close');
+            add('close',close);return {stage:'creator-welcome',controls,needs_scroll:!!close&&!controls.close};
+          }
+          const platform=find(root,'[data-agent-id="onboarding-platform-elevencreative"],button[aria-label="ElevenCreative"]');
+          if(platform){add('platform',platform);add('next',next(root));return {stage:'platform',controls};}
+          const adult=root.querySelector('input[name="adult"],[role="checkbox"][name="adult"],button[name="adult"]');
+          const checkbox=e=>{
+            if(!e||e.disabled)return null;if(visible(e))return e;
+            const labels=[...(e.labels||[]),e.closest('label')].filter(Boolean);
+            for(const label of new Set(labels)){
+              // Radix can associate the wrapper with its preceding button,
+              // leaving this named hidden input's native labels list empty.
+              const buttons=[...label.querySelectorAll('[role="checkbox"]')].filter(visible);
+              if(buttons.length===1)return buttons[0];
+              if(visible(label)&&label.querySelectorAll('input,button,select,textarea').length===1)return label;
+            }
+            return null;
+          };
+          const personal=find(root,'input#firstname,input[name="firstname"],input#source-freetext,input[name="source-freetext"]');
+          const personalForm=personal?.closest('form');
+          if((adult&&checkbox(adult))||(personalForm&&next(personalForm))){
+            const form=adult?.closest('form')||personalForm||root;
+            const blocked=[];
+            for(const key of ['adult','terms','updated']){
+              const e=form.querySelector('[name="'+key+'"]'),target=checkbox(e);
+              if(target){add(key,target);if(controls[key])controls[key].selected=chosen(e)||chosen(target);}
+              else if(e&&key!=='updated')blocked.push(key);
+            }
+            add('next',next(form));return {stage:'personal-info',controls,blocked_controls:blocked};
+          }
+          const creator=find(root,'[data-agent-id="onboarding-icon-option-creator"],[data-agent-id="onboarding-persona-creator"]')||
+            exact(/^(creator|creator content|content creator)$/i);
+          if(creator){add('creator',creator);add('next',next(root));return {stage:'persona',controls};}
+          const youtube=exact(/^YouTube videos$/i),shorts=exact(/^TikTok\s*\/\s*Shorts\s*\/\s*Reels$/i);
+          if(youtube||shorts){add('youtube',youtube);add('shorts',shorts);add('next',next(root));
+            add('skip',exact(/^skip$/i,'button'));return {stage:'persona-details',controls};}
+          const interest=find(root,'[data-agent-id="onboarding-illustration-option-image-video"],button[aria-label="Image & Video"]');
+          if(interest){add('image-video',interest);add('next',next(root));return {stage:'interests',controls};}
+          const pricing=location.pathname==='/app/onboarding'&&!!exact(/^skip$/i,'button')&&
+            [...root.querySelectorAll('h1,h2,h3,p,[data-agent-id]')].some(e=>visible(e)&&
+            (/choose.{0,24}plan|pick.{0,24}plan|pricing|upgrade.{0,24}plan|select.{0,24}plan|creator is the best way to get started|pay as you go on the creator plan/i.test(text(e))||
+             /^onboarding-pricing/.test(e.getAttribute('data-agent-id')||'')));
+          if(pricing){add('skip',exact(/^skip$/i,'button'));return {stage:'pricing',controls};}
+          return {stage:dialogs.length?'unknown-dialog':'waiting',onboarding_path:location.pathname==='/app/onboarding',controls};
+        })()'''.replace("VISIBLE", _VISIBLE_DOM).replace("WELCOME", _CREATOR_WELCOME_DOM)
+        result = self.evaluate(expression)
+        if not isinstance(result, dict):
+            raise BrowserError("onboarding page is still initializing")
+        return result
+
+    def _scroll_creator_welcome_close(self) -> bool:
+        """Reveal the known dialog's Close control, then let the caller re-read it."""
+        expression = r'''(()=>{VISIBLE WELCOME
+          const root=[...document.querySelectorAll('[role="dialog"]')].filter(visible).at(-1);
+          if(!creatorWelcome(root))return false;
+          const close=[...root.querySelectorAll('button')].find(e=>rendered(e)&&text(e)==='Close');
+          if(!close||visible(close))return false;
+          close.scrollIntoView({block:'center',inline:'nearest',behavior:'auto'});return true;
+        })()'''.replace("VISIBLE", _VISIBLE_DOM).replace("WELCOME", _CREATOR_WELCOME_DOM)
+        return self.evaluate(expression) is True
+
+    def complete_onboarding(self, auth: dict[str, Any] | None = None, *, expected_email: str = "") -> dict[str, Any]:
+        """Complete only captured normal UI steps; the server decides completion."""
+        auth = dict(auth or self.collect_auth())
+        email = expected_email.strip() or self._auth_email(auth)
+        self._login_identity(auth, email)
+        deadline, next_verify = time.monotonic() + 120, 0.0
+        acted_in_flow = False
+        last_action: tuple[str, str] | None = None
+        unknown_since: float | None = None
+        entered_onboarding = False
+        welcome_scrolls = 0
+        while time.monotonic() < deadline:
+            try:
+                current = self.collect_auth()
+                if not current.get("access_token"):
+                    time.sleep(.4)
+                    continue
+                self._login_identity(current, email)
+                auth.update({key: value for key, value in current.items() if value not in (None, "", 0)})
+                if time.monotonic() >= next_verify:
+                    if self._onboarding_complete_on_server(auth):
+                        return auth
+                    next_verify = time.monotonic() + 1.5
+                view = self._onboarding_view()
+                stage, controls = view.get("stage"), view.get("controls") or {}
+                if stage == "captcha":
+                    raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
+                if stage == "creator-welcome" and view.get("needs_scroll") and welcome_scrolls < 2:
+                    welcome_scrolls += 1
+                    self._scroll_creator_welcome_close()
+                    time.sleep(.4)
+                    continue
+                if (stage == "waiting" and not view.get("onboarding_path") and not entered_onboarding
+                        and not acted_in_flow):
+                    # A saved local completion flag is not proof of server
+                    # readiness. Enter the website's ordinary captured flow.
+                    self.command("Page.navigate", {"url": BASE + "/app/onboarding"})
+                    entered_onboarding = True
+                    unknown_since = None
+                    time.sleep(.4)
+                    continue
+                choice = None
+                if stage == "platform":
+                    choice = "next" if controls.get("platform", {}).get("selected") else "platform"
+                elif stage == "personal-info":
+                    if view.get("blocked_controls"):
+                        choice = None  # Never submit before a named required control can be resolved.
+                    elif controls.get("updated", {}).get("selected"):
+                        choice = "updated"  # Opt out through the actual checkbox; never opt in.
+                    else:
+                        choice = next((key for key in ("adult", "terms")
+                                       if key in controls and not controls[key].get("selected")), "next")
+                elif stage in {"persona", "interests", "persona-details"}:
+                    keys = {"persona": ("creator",), "interests": ("image-video",),
+                            "persona-details": ("youtube", "shorts")}[stage]
+                    choice = next((key for key in keys if key in controls and not controls[key].get("selected")), "next")
+                    if choice == "next" and choice not in controls and stage == "persona-details":
+                        choice = "skip"
+                elif stage == "pricing":
+                    choice = "skip"  # No plan, trial, purchase or upgrade action exists here.
+                elif stage == "creator-welcome":
+                    choice = "close"  # Captured subscription-benefits notice; no 2FA action.
+                action = controls.get(choice) if choice else None
+                key = (str(stage), str(choice))
+                if action and (key != last_action or choice in {"adult", "terms", "updated"}):
+                    self.click(float(action["x"]), float(action["y"]))
+                    if stage != "creator-welcome":
+                        acted_in_flow = True
+                    last_action = key
+                    unknown_since = None
+                elif stage in {"unknown-dialog", "waiting"} or view.get("blocked_controls") or (choice and not action):
+                    if unknown_since is None:
+                        unknown_since = time.monotonic()
+                    if time.monotonic() - unknown_since >= 6:
+                        raise BrowserRejected("ONBOARDING_REQUIRED: an unknown or incomplete website step needs review")
+                time.sleep(.4)
+            except BrowserRejected:
+                raise
+            except BrowserError:
+                # Navigation, hydration and the final normal save are asynchronous.
+                time.sleep(.4)
+        raise BrowserRejected("ONBOARDING_REQUIRED: normal website onboarding did not finish within its time limit")
+
     def login_with_password(self, email: str, password: str) -> dict[str, Any]:
         """Fill and submit the ordinary sign-in form, retaining normal verification."""
-        auth = self.collect_auth()
-        if auth.get("access_token"):
-            return self._login_identity(auth, email)
-        self.command("Page.navigate", {"url": BASE + "/app/sign-in"})
         deadline = time.monotonic() + 100
-        filled_email = filled_password = email_submitted = password_submitted = False
+        navigated, submitted = False, set()
+        loader_id = None
         while time.monotonic() < deadline:
             try:
                 auth = self.collect_auth()
                 if auth.get("access_token"):
-                    return self._login_identity(auth, email)
-                if not filled_email:
-                    filled_email = self._fill_login_field('input[type="email"],input[name="email"],input[autocomplete="email"]', email)
-                if filled_email and not filled_password:
-                    filled_password = self._fill_login_field('input[type="password"]', password)
-                    if not filled_password and not email_submitted:
-                        email_submitted = self._click_login_submit()
-                if filled_password and not password_submitted:
+                    return self.complete_onboarding(self._login_identity(auth, email), expected_email=email)
+                if not navigated:
+                    loader_id = self.command("Page.navigate", {"url": BASE + "/app/sign-in"}).get("loaderId")
+                    navigated = True
+                if loader_id:
+                    if self.command("Page.getFrameTree").get("frameTree", {}).get("frame", {}).get("loaderId") != loader_id:
+                        time.sleep(.3)
+                        continue
+                    loader_id = None
+                state = self._login_form_state(email, password)
+                if state.get("login_error"):
+                    raise BrowserRejected("LOGIN_FAILED: the website rejected the ordinary sign-in")
+                if state.get("challenge_overlay"):
+                    raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
+                if state.get("email_present") and not state.get("email_matches"):
+                    self._fill_login_field('input[type="email"],input[name="email"],input[autocomplete="email"]', email)
+                if state.get("password_present") and not state.get("password_matches"):
+                    self._fill_login_field('input[type="password"]', password)
+                state = self._login_form_state(email, password)
+                stage = "password" if state.get("password_present") else "email"
+                valid = (state.get("password_valid") and (state.get("email_valid") or not state.get("email_present"))
+                         if stage == "password" else state.get("email_valid"))
+                key = (state.get("document_id"), stage)
+                if valid and state.get("submit_enabled") and key not in submitted:
                     if self._click_login_submit():
-                        password_submitted = True
+                        submitted.add(key)
+                elif valid and state.get("challenge_widget") and not state.get("submit_enabled"):
+                    raise BrowserRejected("CAPTCHA_REQUIRED: complete normal website verification")
             except BrowserRejected:
                 raise
             except BrowserError:
                 # A normal form submit can replace its execution context.
                 pass
             time.sleep(.5)
-        challenge = self.evaluate("[...document.querySelectorAll('iframe[src*=\"hcaptcha\"]')].some(e=>{const r=e.getBoundingClientRect();return r.width>150&&r.height>100;})")
-        if challenge:
-            raise BrowserRejected("CAPTCHA_REQUIRED: the account needs the website's normal verification")
         raise BrowserRejected("LOGIN_FAILED: the ordinary email/password sign-in did not complete")
 
     def screenshot(self) -> str:

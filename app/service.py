@@ -34,6 +34,16 @@ MAX_LOGIN_JOBS = 100
 logger = logging.getLogger(__name__)
 
 
+def account_login_failure(error: Exception) -> tuple[str, str]:
+    """Keep account diagnostics useful without publishing private browser data."""
+    reason = str(error).upper()
+    if "CAPTCHA_REQUIRED" in reason:
+        return "verification_required", "网站需要人工验证，请打开网页登录完成验证"
+    if "ONBOARDING_REQUIRED" in reason:
+        return "onboarding_required", "登录后设置尚未完成，请重试完成年龄确认和偏好设置"
+    return "login_required", "登录验证未完成，请重试自动登录或完成网页登录"
+
+
 class AccountCreditRejected(Exception):
     """The upstream explicitly rejected this account after a terminal result."""
 
@@ -276,24 +286,25 @@ class Service:
             account, owned = self.browser_runtime.acquire(account, force_managed=True)
             self.store.update_account(account_id, {"status": "logging_in"})
             with self._lock:
-                self._login_results[account_id].update(status="running", message="正在正常网页登录", updated_at=time.time())
+                self._login_results[account_id].update(status="running", message="正在网页登录并自动完成年龄确认和偏好设置", updated_at=time.time())
             auth = CDPBrowser(int(account["cdp_port"])).login_with_password(
                 str(account["login_email"]), str(account["login_password"]))
             if not auth.get("access_token"):
                 raise BrowserRejected("LOGIN_FAILED")
             self.store.update_account(account_id, {key: auth[key] for key in ACCOUNT_AUTH_FIELDS if key in auth})
             self.store.clear_media_cache(account_id)
-            checked = self._check_account_live(self.store.account(account_id, private=True))
+            checked = self._check_account_live(self.store.account(account_id, private=True), login_owner=True)
             if checked["status"] not in {"active", "disabled_low_balance"}:
-                raise BrowserRejected("LOGIN_FAILED")
+                status = checked["status"]
+                message = checked["last_error"]
+                return
             if checked["status"] == "active":
                 self.store.update_account(account_id, {"enabled": True})
             status = checked["status"]
-            message = "登录及额度验证成功" if status == "active" else "登录成功，余额低于停用阈值"
+            message = ("登录、年龄确认、偏好设置及额度验证成功" if status == "active"
+                       else "登录及年龄偏好设置完成，余额低于停用阈值")
         except Exception as error:
-            challenge = isinstance(error, BrowserRejected) and "CAPTCHA_REQUIRED" in str(error)
-            status = "verification_required" if challenge else "login_required"
-            message = "网站需要人工验证，请打开网页登录完成验证" if challenge else "自动登录未完成，请重试或使用网页登录"
+            status, message = account_login_failure(error)
             if self.store.account(account_id):
                 self.store.update_account(account_id, {"status": status, "last_error": message, "enabled": False})
         finally:
@@ -377,7 +388,7 @@ class Service:
                     continue
                 try:
                     checked = self.check_account(int(account["id"]))
-                    if checked["status"] == "login_required":
+                    if checked["status"] in {"login_required", "network_error"}:
                         needs_rapid_recheck = True
                     if checked["status"] == "active" and settings["daily_checkin_enabled"]:
                         self.checkin_account(int(account["id"]))
@@ -480,20 +491,59 @@ class Service:
         with self._lock:
             self._active[account_id] = max(self._active.get(account_id, 1) - 1, 0)
 
-    def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
+    def check_account(self, account_id: int, *, start_browser: bool = False,
+                      complete_onboarding: bool = False) -> dict[str, Any]:
         if self.login_in_progress(account_id):
             raise BrowserError("account automatic login is in progress")
         account = self.store.account(account_id, private=True)
         if not account:
             raise KeyError(account_id)
-        account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
+        enable_after = False
+        if complete_onboarding:
+            # Reserve this identity before touching the page. Other accounts'
+            # tasks and normal read-only maintenance keep their own leases.
+            with self._lock:
+                account = self.store.account(account_id, private=True)
+                if (not account or self.login_in_progress(account_id) or account["status"] == "logging_in"
+                        or self._active.get(account_id, 0) or self.store.unresolved_account_count(account_id)):
+                    raise BrowserError("account has an active login or unresolved task")
+                account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
+                enable_after = bool(account["enabled"] or account["status"] in {
+                    "pending", "login_required", "verification_required", "onboarding_required", "login_pending"})
+                self.store.update_account(account_id, {"status": "logging_in", "enabled": False})
+        else:
+            account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
         try:
-            return self._check_account_live(account)
+            if complete_onboarding:
+                try:
+                    auth = CDPBrowser(int(account["cdp_port"])).complete_onboarding(
+                        expected_email=str(account.get("login_email") or ""))
+                    if not auth.get("access_token"):
+                        raise BrowserRejected("LOGIN_REQUIRED")
+                    self.store.update_account(account_id, {key: auth[key] for key in ACCOUNT_AUTH_FIELDS if key in auth})
+                    account = self.store.account(account_id, private=True)
+                except BrowserError as error:
+                    status, message = account_login_failure(error)
+                    return self.store.update_account(account_id, {"status": status, "last_error": message, "enabled": False})
+            checked = self._check_account_live(account, login_owner=complete_onboarding)
+            if complete_onboarding and checked["status"] == "active":
+                checked = self.store.update_account(account_id, {"enabled": enable_after})
+            return checked
         finally:
             self.browser_runtime.release(account, owned)
 
-    def _check_account_live(self, account: dict[str, Any]) -> dict[str, Any]:
+    def _check_account_live(self, account: dict[str, Any], *, login_owner: bool = False) -> dict[str, Any]:
         account_id = int(account["id"])
+
+        def update_checked(values: dict[str, Any]) -> dict[str, Any]:
+            with self._lock:
+                current = self.store.account(account_id)
+                if not login_owner and current and current["status"] in {"logging_in", "login_pending"}:
+                    # A background request started before the login reservation
+                    # cannot publish its stale readiness result over that login.
+                    return current
+                return self.store.update_account(account_id, values)
+
         # Chrome exposes a CDP page before ElevenLabs's JavaScript has finished
         # loading. After a service restart, one early fetch failure should not
         # put an otherwise valid account into login_required for an entire
@@ -502,13 +552,29 @@ class Service:
             client = None
             try:
                 client = EleClient(account, store=self.store)
+                if not client.onboarding_complete():
+                    return update_checked({
+                        "status": "onboarding_required", "enabled": False,
+                        "last_error": "登录后设置尚未完成，请重试完成年龄确认和偏好设置"})
                 state = client.account_state()
                 break
             except BrowserRejected as exc:
-                return self.store.update_account(account_id, {"status": "login_required", "last_error": str(exc)[:300]})
+                if re.match(r"ElevenLabs HTTP (?:408|425|429|5\d\d):", str(exc)):
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    return update_checked({"status": "network_error",
+                                           "last_error": "上游暂时不可用，请稍后重试登录验证"})
+                status, message = account_login_failure(exc)
+                return update_checked({"status": status, "enabled": False, "last_error": message})
             except BrowserError as exc:
                 if attempt == 2:
-                    return self.store.update_account(account_id, {"status": "login_required", "last_error": str(exc)[:300]})
+                    status, message = account_login_failure(exc)
+                    values = {"status": status, "last_error": message}
+                    if any(marker in str(exc).upper() for marker in (
+                            "LOGIN_REQUIRED", "ONBOARDING_REQUIRED", "CAPTCHA_REQUIRED")):
+                        values["enabled"] = False
+                    return update_checked(values)
                 time.sleep(1)
             finally:
                 if client is not None:
@@ -520,7 +586,7 @@ class Service:
         if threshold > 0 and balance is not None and balance < threshold:
             values.update({"enabled": False, "status": "disabled_low_balance",
                            "last_error": f"credit balance below {threshold}"})
-        return self.store.update_account(account_id, values)
+        return update_checked(values)
 
     def _run(self, task_id: str) -> None:
         # Multiple dispatcher/recovery calls must never turn one queued task

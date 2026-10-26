@@ -113,11 +113,24 @@ def test_refresh_requires_session_before_network(monkeypatch):
 def test_login_fills_both_standard_fields_and_submits_once(monkeypatch):
     browser = CDPBrowser(12345)
     submitted, filled, navigation = [], [], []
+    fields = {"email": "", "password": ""}
     expected = token({'email': 'person@example.test'})
     monkeypatch.setattr(browser, 'collect_auth', lambda: {'access_token': expected} if submitted else {})
     monkeypatch.setattr(browser, 'command', lambda *args: navigation.append(args) or {})
-    monkeypatch.setattr(browser, '_fill_login_field', lambda selector, text: filled.append((selector, text)) or True)
+    def fill(selector, text):
+        filled.append((selector, text))
+        fields['password' if 'password' in selector else 'email'] = text
+        return True
+    def state(*args):
+        return {'document_id': 'ready-document', 'email_present': True, 'password_present': True,
+                'email_matches': fields['email'] == 'person@example.test',
+                'email_valid': fields['email'] == 'person@example.test',
+                'password_matches': fields['password'] == 'private-password',
+                'password_valid': fields['password'] == 'private-password', 'submit_enabled': True}
+    monkeypatch.setattr(browser, '_login_form_state', state)
+    monkeypatch.setattr(browser, '_fill_login_field', fill)
     monkeypatch.setattr(browser, '_click_login_submit', lambda: submitted.append(True) or True)
+    monkeypatch.setattr(browser, 'complete_onboarding', lambda auth, **kwargs: auth)
     monkeypatch.setattr('app.browser.time.sleep', lambda seconds: None)
     result = browser.login_with_password('person@example.test', 'private-password')
     assert result['access_token'] == expected
@@ -140,6 +153,7 @@ def test_late_browser_session_recovery_must_match_imported_email(monkeypatch):
     states = iter([{}, {'access_token': token({'email': 'other@example.test'})}])
     monkeypatch.setattr(browser, 'collect_auth', lambda: next(states))
     monkeypatch.setattr(browser, 'command', lambda *args: {})
+    monkeypatch.setattr(browser, '_login_form_state', lambda *args: {})
     monkeypatch.setattr(browser, '_fill_login_field', lambda *args: pytest.fail('wrong recovered identity filled credentials'))
     with pytest.raises(BrowserRejected, match='browser identity differs'):
         browser.login_with_password('person@example.test', 'private-password')
