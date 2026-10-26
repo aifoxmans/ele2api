@@ -69,6 +69,9 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr(value.browser_runtime, "acquire", lambda account, **_: ({**account, "cdp_port": 19300 + account["id"]}, False))
     Client.submissions, Client.error = 0, None
     monkeypatch.setattr("app.service.EleClient", Client)
+    # Scheduler tests retain the default-reference snapshot without invoking a
+    # real codec. The generated clip has separate FFmpeg integration coverage.
+    monkeypatch.setattr("app.service.ensure_reference_video", lambda *args, **kwargs: tmp_path / "synthetic-reference.mp4")
     yield value
     value.stop()
 
