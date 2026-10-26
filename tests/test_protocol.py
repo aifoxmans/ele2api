@@ -8,7 +8,10 @@ import requests
 
 from app.browser import BrowserRejected
 from app.catalog import normalize_request
-from app.client import GENERATION, EleClient, EleError, build_submit_body, build_video_param, extract_result_urls
+from app.client import (
+    GENERATION, AccountModelUnavailable, AccountQuotaRejected, EleClient, EleError,
+    build_submit_body, build_video_param, extract_result_urls,
+)
 from app.media import MediaError, upload_media_bytes, validate_material_durations
 
 
@@ -126,6 +129,68 @@ def test_explicit_generation_business_rejection_is_distinct():
                                      SimpleNamespace(status_code=400, ok=False, json=lambda: {"detail": {"status": "insufficient_credits", "message": "Insufficient credits"}}))
     with pytest.raises(BrowserRejected, match="Insufficient credits"):
         client.request("POST", GENERATION, {})
+
+
+@pytest.mark.parametrize("path", [GENERATION, GENERATION + "/price", GENERATION + "/check-references"])
+def test_explicit_unaccepted_quota_has_account_budget_evidence(path):
+    client = bare_client()
+    message = "This request exceeds your quota of 100. You have 5 credits remaining, while 20 credits are required for this request."
+    client.session = SimpleNamespace(request=lambda *args, **kwargs: SimpleNamespace(
+        status_code=401, ok=False, json=lambda: {"detail": {"status": "quota_exceeded", "message": message}}))
+    with pytest.raises(AccountQuotaRejected) as failure:
+        client.request("POST", path, {})
+    assert failure.value.submit_outcome == "not_accepted"
+    assert failure.value.remaining_credits == 5 and failure.value.required_credits == 20
+
+
+@pytest.mark.parametrize("method,path,detail", [
+    ("GET", GENERATION + "/synthetic-run", {"status": "quota_exceeded", "message": "not enough credits"}),
+    ("POST", GENERATION, {"status": "invalid_api_key", "message": "not enough credits"}),
+    ("POST", GENERATION, {"status": "detected_unusual_activity", "message": "request limit exceeded"}),
+    ("POST", GENERATION, {"status": "quota_exceeded", "message": "CAPTCHA required"}),
+])
+def test_auth_risk_and_poll_errors_are_not_unaccepted_quota_permissions(method, path, detail):
+    client = bare_client()
+    client.session = SimpleNamespace(request=lambda *args, **kwargs: SimpleNamespace(
+        status_code=401, ok=False, json=lambda: {"detail": detail}))
+    with pytest.raises(BrowserRejected) as failure:
+        client.request(method, path, {})
+    assert type(failure.value) is BrowserRejected
+
+
+@pytest.mark.parametrize("body", [
+    {"id": "synthetic-run", "detail": {"status": "quota_exceeded"}},
+    {"detail": {"status": "quota_exceeded", "generation_id": "synthetic-run"}},
+    {"detail": {"status": "quota_exceeded", "outcome": "unknown"}},
+    {"uncertain": True, "detail": {"status": "quota_exceeded"}},
+])
+@pytest.mark.parametrize("status", [200, 401])
+def test_quota_wrapper_cannot_override_any_receipt_or_unknown_outcome(body, status):
+    client = bare_client()
+    client.session = SimpleNamespace(request=lambda *args, **kwargs: SimpleNamespace(status_code=status, ok=status < 400, json=lambda: body))
+    with pytest.raises(EleError, match="ambiguous"):
+        client.request("POST", GENERATION, {})
+
+
+@pytest.mark.parametrize("reason,code", [("provider_moderation", "CONTENT_MODERATION_FAILED"),
+                                         ("model_error", "UPSTREAM_MODEL_ERROR"), ("other_error", "UPSTREAM_FAILED")])
+def test_observed_terminal_failure_reason_preserves_message_and_specific_code(reason, code):
+    client = bare_client()
+    client.request = lambda *args, **kwargs: {"id": "synthetic-run", "generation_session_id": "synthetic-session",
+        "status": "failed", "failure_reason": reason, "error_message": "Synthetic provider failure"}
+    result = client.poll("synthetic-run", "synthetic-session")
+    assert result["error_code"] == code and result["error_message"] == "Synthetic provider failure"
+    assert result["cost_evidence"]["source"] == "unknown"
+
+
+def test_restricted_account_model_is_typed_before_any_upload(monkeypatch):
+    client = bare_client()
+    value = normalized("sd-2-0-mini", resolution="480p")
+    client.request = lambda *args, **kwargs: {"models": [{"model_id": value["upstream_model"], "is_region_restricted": True}]}
+    monkeypatch.setattr(client, "_upload_input", lambda *args: pytest.fail("restricted model downloaded media"))
+    with pytest.raises(AccountModelUnavailable) as failure:
+        client.upload_inputs(value)
+    assert failure.value.model == value["upstream_model"] and failure.value.submit_outcome == "not_accepted"
 
 
 def test_submit_normal_flow_has_one_captcha_and_one_generation_without_secret_audit():

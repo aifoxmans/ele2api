@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.browser import BrowserError, BrowserRejected
+from app.client import AccountModelUnavailable, AccountQuotaRejected
 from app.service import Service
 from app.store import Store
 
@@ -508,6 +509,208 @@ def test_explicit_generation_failure_preserves_upstream_reason(service, monkeypa
     assert stored["error_message"] == "Generation rejected by content policy"
     assert service.public_task(stored)["error"]["category"] == "content_policy"
     assert FailedClient.submissions == 1
+
+
+def extra_account(service, name, *, enabled=True):
+    account = service.store.upsert_account({"name": name, "proxy_url": "socks5://proxy.test:1081", "priority": 0,
+                                           "enabled": enabled, "access_token": "synthetic-session"})
+    return service.store.update_account(account["id"], {"status": "active", "balance": 100})
+
+
+def test_unaccepted_quota_rejection_uses_another_eligible_account_without_enabling_disabled_accounts(service, monkeypatch):
+    second = extra_account(service, "second")
+    calls = []
+
+    class QuotaClient(Client):
+        def submit(self, normalized, assets):
+            calls.append(self.account["id"])
+            if self.account["id"] == 1:
+                raise AccountQuotaRejected("synthetic quota rejection", remaining_credits=5, required_credits=20)
+            return super().submit(normalized, assets)
+
+    monkeypatch.setattr("app.service.EleClient", QuotaClient)
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service._run(task["id"])
+    stored = service.store.task(task["id"])
+    assert stored["status"] == "succeeded" and stored["account_id"] == second["id"]
+    assert calls == [1, second["id"]] and QuotaClient.submissions == 1
+    assert stored["estimated_cost"] == 20 and service.store.account(1)["balance"] == 5
+    assert service._active[1] == service._active[second["id"]] == 0
+
+
+def test_user_disabled_account_is_never_reenabled_or_used_during_account_fallback(service, monkeypatch):
+    service.store.update_account(1, {"enabled": False, "balance": 0})
+    second = extra_account(service, "second")
+    calls = []
+
+    class SelectedClient(Client):
+        def __init__(self, account, **kwargs):
+            calls.append(account["id"])
+            super().__init__(account, **kwargs)
+
+    monkeypatch.setattr("app.service.EleClient", SelectedClient)
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service._run(task["id"])
+    assert calls == [second["id"]] and service.store.task(task["id"])["status"] == "succeeded"
+    assert not service.store.account(1)["enabled"] and service.store.account(1)["balance"] == 0
+
+
+def test_model_restrictions_are_per_account_model_and_do_not_consume_credit_retry_limit(service, monkeypatch):
+    accounts = [extra_account(service, "other-" + str(i)) for i in range(3)]
+    allowed = accounts[-1]["id"]
+    checked = []
+
+    class ModelClient(Client):
+        def upload_inputs(self, normalized):
+            checked.append(self.account["id"])
+            if self.account["id"] != allowed:
+                raise AccountModelUnavailable("synthetic account model restriction", model=normalized["upstream_model"])
+            return super().upload_inputs(normalized)
+
+    monkeypatch.setattr("app.service.EleClient", ModelClient)
+    task = service.create({"model": "sd-2-0-mini", "prompt": "landscape", "resolution": "480p"})
+    service._run(task["id"])
+    assert checked == [1, *[item["id"] for item in accounts]]
+    assert service.store.task(task["id"])["status"] == "succeeded"
+    assert service.store.task(task["id"])["attempted_account_ids"] == [allowed]
+    assert all(account["enabled"] for account in service.store.accounts())
+    target = service.store.task(task["id"])["normalized"]["upstream_model"]
+    assert not service._account_model_available(1, target)
+    assert service._account_model_available(1, "another-authorized-model")
+    service._model_restrictions[(1, target)] = time.monotonic() - 1
+    assert service._account_model_available(1, target)
+
+
+def test_all_model_restrictions_stop_promptly_and_cached_selection_does_not_wait(service, monkeypatch):
+    extra_account(service, "second")
+    checked = []
+
+    class RestrictedClient(Client):
+        def upload_inputs(self, normalized):
+            checked.append(self.account["id"])
+            raise AccountModelUnavailable("synthetic model is restricted for this account", model=normalized["upstream_model"])
+
+    monkeypatch.setattr("app.service.EleClient", RestrictedClient)
+    monkeypatch.setattr(service._stop, "wait", lambda *args: pytest.fail("all restricted accounts should not idle-wait"))
+    for _ in range(2):
+        task = service.create({"model": "sd-2-0-mini", "prompt": "landscape", "resolution": "480p"})
+        service._run(task["id"])
+        stored = service.store.task(task["id"])
+        assert stored["status"] == "failed" and stored["error_code"] == "ACCOUNT_MODEL_UNAVAILABLE"
+        assert not stored["run_id"]
+    assert checked == [1, 2] and RestrictedClient.submissions == 0
+    assert all(account["enabled"] for account in service.store.accounts())
+
+
+def test_one_task_does_not_revisit_model_rejections_after_cross_task_cache_expires(service, monkeypatch):
+    extra_account(service, "second")
+    checked = []
+    clock = [0.0]
+
+    class SlowRestrictedClient(Client):
+        def upload_inputs(self, normalized):
+            assert self.account["id"] not in checked, "one task revisited a rejected account after the cache TTL"
+            checked.append(self.account["id"])
+            clock[0] += 301
+            raise AccountModelUnavailable("synthetic model is restricted for this account", model=normalized["upstream_model"])
+
+    monkeypatch.setattr("app.service.EleClient", SlowRestrictedClient)
+    monkeypatch.setattr("app.service.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(service._stop, "wait", lambda *args: pytest.fail("all rejected accounts must finish without waiting"))
+    task = service.create({"model": "sd-2-0-mini", "prompt": "landscape", "resolution": "480p"})
+    service._run(task["id"])
+    stored = service.store.task(task["id"])
+    assert checked == [1, 2] and stored["error_code"] == "ACCOUNT_MODEL_UNAVAILABLE"
+    assert stored["status"] == "failed" and stored["attempted_account_ids"] == []
+    assert SlowRestrictedClient.submissions == 0
+
+
+@pytest.mark.parametrize("code", ["UPSTREAM_MODEL_ERROR", "CONTENT_MODERATION_FAILED"])
+def test_definitive_provider_model_and_moderation_failures_keep_original_run_without_switching(service, monkeypatch, code):
+    extra_account(service, "second")
+
+    class TerminalClient(Client):
+        def poll(self, run_id, thread_id):
+            return {"status": "failed", "error_code": code, "error_message": "Synthetic provider failure"}
+
+    monkeypatch.setattr("app.service.EleClient", TerminalClient)
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service._run(task["id"])
+    stored = service.store.task(task["id"])
+    assert stored["status"] == "failed" and stored["error_code"] == code
+    assert stored["account_id"] == 1 and stored["run_id"] == "upstream-task"
+    assert TerminalClient.submissions == 1
+
+
+def test_accepted_poll_quota_error_never_switches_or_reposts(service, monkeypatch):
+    extra_account(service, "second")
+
+    class PollQuotaClient(Client):
+        def poll(self, *_):
+            raise AccountQuotaRejected("synthetic query rejection")
+
+    monkeypatch.setattr("app.service.EleClient", PollQuotaClient)
+    monkeypatch.setattr("app.service.time.sleep", lambda *args: None)
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service._run(task["id"])
+    stored = service.store.task(task["id"])
+    assert stored["status"] == "submission_unknown" and stored["run_id"] == "upstream-task"
+    assert stored["account_id"] == 1 and PollQuotaClient.submissions == 1
+
+
+def test_resume_initialization_rejection_preserves_accepted_task_identity(service, monkeypatch):
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service.store.update_task(task["id"], {"status": "submitted", "account_id": 1,
+                                         "run_id": "synthetic-run", "thread_id": "synthetic-session"})
+
+    def unavailable(*args, **kwargs):
+        raise BrowserRejected("LOGIN_REQUIRED: synthetic session expired")
+
+    monkeypatch.setattr("app.service.EleClient", unavailable)
+    service._resume_poll(task["id"])
+    stored = service.store.task(task["id"])
+    assert stored["status"] == "submission_unknown"
+    assert (stored["run_id"], stored["thread_id"]) == ("synthetic-run", "synthetic-session")
+    assert Client.submissions == 0 and service._active[1] == 0
+
+
+def test_existing_explicit_terminal_credit_rejection_can_use_one_other_account(service, monkeypatch):
+    second = extra_account(service, "second")
+    selected = []
+
+    class CreditClient(Client):
+        def submit(self, normalized, assets):
+            selected.append(self.account["id"])
+            return super().submit(normalized, assets)
+
+        def poll(self, run_id, thread_id):
+            if self.account["id"] == 1:
+                return {"status": "failed", "error_code": "UPSTREAM_FAILED", "error_message": "not enough credits"}
+            return super().poll(run_id, thread_id)
+
+    monkeypatch.setattr("app.service.EleClient", CreditClient)
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service._run(task["id"])
+    assert selected == [1, second["id"]]
+    assert service.store.task(task["id"])["status"] == "succeeded"
+
+
+def test_quota_switch_limit_remains_two_accounts(service, monkeypatch):
+    extra_account(service, "second")
+    extra_account(service, "third")
+    selected = []
+
+    class QuotaClient(Client):
+        def submit(self, normalized, assets):
+            selected.append(self.account["id"])
+            raise AccountQuotaRejected("synthetic quota rejection")
+
+    monkeypatch.setattr("app.service.EleClient", QuotaClient)
+    task = service.create({"model": "sd-2-5-480p", "prompt": "landscape"})
+    service._run(task["id"])
+    stored = service.store.task(task["id"])
+    assert selected == [1, 2] and stored["error_code"] == "INSUFFICIENT_CREDITS"
+    assert stored["status"] == "failed" and not stored["run_id"]
 
 
 def test_manual_reward_does_not_mark_daily_claim_complete(service):

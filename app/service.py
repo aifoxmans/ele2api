@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 from .browser import BrowserError, BrowserRejected, CDPBrowser
 from .browser_runtime import BrowserRuntime
 from .catalog import normalize_request
-from .client import EleClient, EleError, account_media_lock
+from .client import AccountModelUnavailable, AccountQuotaRejected, EleClient, EleError, account_media_lock
 from .errors import public_error
 from .media import MediaError
 from .reference_video import REFERENCE_RESOLUTIONS, ensure_reference_video
@@ -29,6 +29,7 @@ from .store import ACCOUNT_AUTH_FIELDS, Store
 
 TERMINAL = {"succeeded", "failed", "expired"}
 MAX_CREDIT_ACCOUNT_ATTEMPTS = 2
+ACCOUNT_MODEL_RESTRICTION_TTL_SECONDS = 300
 AUTO_PROXY_PORTS = (*range(20001, 20023), *range(20031, 20041))
 MAX_LOGIN_JOBS = 100
 logger = logging.getLogger(__name__)
@@ -89,7 +90,7 @@ def _credit_rejected(message: str) -> bool:
     value = message.lower()
     return any(token in value for token in (
         "credit not enough", "credits not enough", "not enough credits",
-        "insufficient credits", "insufficient balance"))
+        "insufficient credits", "insufficient balance", "this request exceeds your quota"))
 
 
 def _estimate_cost(normalized: dict[str, Any], costs: list[dict[str, Any]]) -> float:
@@ -148,6 +149,7 @@ class Service:
         self._login_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ele-login")
         self._lock = threading.RLock()
         self._active: dict[int, int] = {}
+        self._model_restrictions: dict[tuple[int, str], float] = {}
         self._claimed_tasks: set[str] = set()
         self._login_pending: set[int] = set()
         self._login_results: dict[int, dict[str, Any]] = {}
@@ -536,7 +538,7 @@ class Service:
         return self.public_task(task)
 
     def _reserve_account(self, estimated_cost: float = 0, *,
-                         exclude_ids: set[int] | None = None) -> dict[str, Any] | None:
+                         exclude_ids: set[int] | None = None, model: str = "") -> dict[str, Any] | None:
         excluded = exclude_ids or set()
         with self._lock:
             if sum(self._active.values()) >= int(self.settings()["task_workers"]):
@@ -544,6 +546,7 @@ class Service:
             accounts = [item for item in self.store.accounts(private=True)
                         if int(item["id"]) not in excluded and item["enabled"]
                         and item["status"] == "active" and item["proxy_url"]
+                        and self._account_model_available(int(item["id"]), model)
                         and (item["balance"] is None or float(item["balance"]) >= estimated_cost)]
             accounts.sort(key=lambda item: (-int(item["priority"]), -(float(item["balance"] or 0)), item["id"]))
             for account in accounts:
@@ -555,9 +558,14 @@ class Service:
                 return account
         return None
 
-    def _has_eligible_account(self, estimated_cost: float, excluded: set[int]) -> bool:
+    def _account_model_available(self, account_id: int, model: str) -> bool:
+        with self._lock:
+            return not model or self._model_restrictions.get((account_id, model), 0) <= time.monotonic()
+
+    def _has_eligible_account(self, estimated_cost: float, excluded: set[int], *, model: str = "") -> bool:
         return any(int(item["id"]) not in excluded and item["enabled"]
                    and item["status"] == "active" and item["proxy_url"]
+                   and self._account_model_available(int(item["id"]), model)
                    and (item["balance"] is None or float(item["balance"]) >= estimated_cost)
                    for item in self.store.accounts(private=True))
 
@@ -686,10 +694,15 @@ class Service:
             if estimated_cost > 0:
                 self.store.update_task(task_id, {"estimated_cost": estimated_cost})
         attempted = list(task["attempted_account_ids"])
+        model_excluded: set[int] = set()
+        target_model = task["normalized"]["upstream_model"]
         credit_reason = task.get("error_message") or "ElevenLabs account has insufficient credits"
         unavailable_code = "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE"
         unavailable_message = credit_reason if attempted else "no available ElevenLabs account"
-        if not self._has_eligible_account(estimated_cost, set(attempted)):
+        if not self._has_eligible_account(estimated_cost, set(attempted) | model_excluded, model=target_model):
+            if self._has_eligible_account(estimated_cost, set(attempted) | model_excluded):
+                unavailable_code = "ACCOUNT_MODEL_UNAVAILABLE"
+                unavailable_message = "no eligible ElevenLabs account currently supports the requested model"
             self._fail(task_id, unavailable_code, unavailable_message)
             return
         # The executor is only a waiter/dispatcher.  The configurable limit
@@ -698,7 +711,7 @@ class Service:
             current = self.store.task(task_id)
             if not current or current["status"] != "queued":
                 return
-            if not self._has_eligible_account(estimated_cost, set(attempted)):
+            if not self._has_eligible_account(estimated_cost, set(attempted) | model_excluded, model=target_model):
                 self._fail(task_id, unavailable_code, unavailable_message)
                 return
             if not self._worker_slots.acquire(timeout=1):
@@ -721,15 +734,13 @@ class Service:
                 account = None
                 account_deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
                 while not self._stop.is_set() and time.monotonic() < account_deadline:
-                    account = self._reserve_account(estimated_cost, exclude_ids=set(attempted))
+                    account = self._reserve_account(estimated_cost, exclude_ids=set(attempted) | model_excluded, model=target_model)
                     if account or not self._has_eligible_account(
-                            estimated_cost, set(attempted)):
+                            estimated_cost, set(attempted) | model_excluded, model=target_model):
                         break
                     self._stop.wait(1)
                 if not account:
-                    code = "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE"
-                    message = credit_reason if attempted else "no available ElevenLabs account"
-                    self._fail(task_id, code, message)
+                    self._fail(task_id, unavailable_code, unavailable_message)
                     return
                 account_id = int(account["id"])
                 owned = False
@@ -765,11 +776,11 @@ class Service:
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
                     try:
                         submitted = client.submit(task["normalized"], assets)
+                    except (AccountQuotaRejected, AccountModelUnavailable):
+                        raise
                     except BrowserRejected as exc:
-                        if not _credit_rejected(str(exc)):
-                            self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
-                            return
-                        raise AccountCreditRejected(str(exc)) from exc
+                        self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
+                        return
                     except BrowserError as exc:
                         self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                                    str(exc) + "; automatic resubmission is disabled")
@@ -786,8 +797,35 @@ class Service:
                     self._poll(task_id, client,
                                time.monotonic() + int(self.settings()["task_timeout_seconds"]))
                     return
-                except AccountCreditRejected as exc:
+                except AccountModelUnavailable as exc:
+                    if (self.store.task(task_id) or {}).get("run_id") or exc.submit_outcome != "not_accepted":
+                        self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", str(exc))
+                        return
+                    with self._lock:
+                        self._model_restrictions[(account_id, target_model)] = (
+                            time.monotonic() + ACCOUNT_MODEL_RESTRICTION_TTL_SECONDS)
+                    model_excluded.add(account_id)
+                    attempted = [value for value in attempted if value != account_id]
+                    unavailable_code, unavailable_message = exc.code, str(exc)
+                    self.store.update_task(task_id, {"status": "queued", "progress": 0,
+                        "account_id": None, "run_id": "", "thread_id": "", "balance_before": None,
+                        "attempted_account_ids": attempted, "error_code": exc.code, "error_message": str(exc)})
+                    continue
+                except (AccountCreditRejected, AccountQuotaRejected) as exc:
+                    if isinstance(exc, AccountQuotaRejected):
+                        if (self.store.task(task_id) or {}).get("run_id") or exc.submit_outcome != "not_accepted":
+                            self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", str(exc))
+                            return
+                        if account_id not in attempted:
+                            attempted.append(account_id)
+                            self.store.update_task(task_id, {"attempted_account_ids": attempted})
+                        if exc.remaining_credits is not None:
+                            self.store.update_account(account_id, {"balance": exc.remaining_credits})
+                        if exc.required_credits is not None:
+                            estimated_cost = max(estimated_cost, exc.required_credits)
+                            self.store.update_task(task_id, {"estimated_cost": estimated_cost})
                     credit_reason = str(exc)
+                    unavailable_code, unavailable_message = "INSUFFICIENT_CREDITS", credit_reason
                     self.store.update_account(account_id, {"last_error": credit_reason[:300]})
                     logger.warning("ELE task %s credit rejection on account %s (attempt %s/%s)",
                                    task_id, account_id, len(attempted), MAX_CREDIT_ACCOUNT_ATTEMPTS)
@@ -912,9 +950,9 @@ class Service:
                 return
             if state["status"] == "failed":
                 reason = state.get("error") or state.get("error_message") or "ElevenLabs video generation failed"
-                if _credit_rejected(reason):
-                    raise AccountCreditRejected(reason)
                 code = state.get("error_code") or "UPSTREAM_FAILED"
+                if code not in {"UPSTREAM_MODEL_ERROR", "CONTENT_MODERATION_FAILED"} and _credit_rejected(reason):
+                    raise AccountCreditRejected(reason)
                 self.store.update_task(task_id, cost_values(state))
                 self._fail(task_id, code, reason)
                 return
@@ -926,7 +964,7 @@ class Service:
 
     def _fail(self, task_id: str, code: str, message: str) -> None:
         current = self.store.task(task_id) or {}
-        if current.get("run_id") and code in {"INTERNAL_ERROR", "BROWSERERROR", "ELEERROR", "VALUEERROR", "RESULT_MISSING"}:
+        if current.get("run_id") and code in {"INTERNAL_ERROR", "BROWSERERROR", "BROWSERREJECTED", "ELEERROR", "VALUEERROR", "RESULT_MISSING"}:
             code = "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"
         unknown = code == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"
         self.store.update_task(task_id, {"status": "submission_unknown" if unknown else "failed", "progress": 35 if unknown else 100,

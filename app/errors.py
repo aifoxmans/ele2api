@@ -27,7 +27,8 @@ def public_error(code: str, message: str) -> dict[str, str]:
         public = "参考图片中检测到可能存在真人，暂不支持，请更换图片后重试，积分已返还~"
         category = "content_policy"
     elif kind == "CONTENT_MODERATION_FAILED" or any(value in raw for value in (
-            "content policy", "inappropriate", "sensitive", "moderation", "违规", "敏感", "审核未通过", "版权", "copyright")):
+            "content policy", "inappropriate", "sensitive", "moderation", "违规", "敏感", "审核未通过", "版权", "copyright",
+            "this generation may violate our terms of service", "this generation violates our terms of service")):
         public = "检测到内容有敏感或违规情况，请修改后重试，积分已返还～"
         category = "content_policy"
     elif kind == "MEDIA_DOWNLOAD_FAILED" or any(value in raw for value in (
@@ -43,9 +44,9 @@ def public_error(code: str, message: str) -> dict[str, str]:
     elif kind == "VIDEO_EDIT_CONSTRAINT" or "duration" in raw and any(value in raw for value in ("invalid", "must", "unsupported")):
         public = "素材时长不支持，请修改后再试~"
         category = "invalid_request"
-    elif kind in {"ACCOUNT_POOL_UNAVAILABLE", "ACCOUNT_MISSING", "BROWSERERROR", "INSUFFICIENT_CREDITS", "UPSTREAM_TEMPORARY", "MEDIA_UPLOAD_FAILED", "CAPTCHA_REQUIRED", "LOGIN_REQUIRED", "LOGIN_FAILED"} or any(value in raw for value in (
+    elif kind in {"ACCOUNT_POOL_UNAVAILABLE", "ACCOUNT_MODEL_UNAVAILABLE", "ACCOUNT_MISSING", "BROWSERERROR", "INSUFFICIENT_CREDITS", "UPSTREAM_TEMPORARY", "MEDIA_UPLOAD_FAILED", "CAPTCHA_REQUIRED", "LOGIN_REQUIRED", "LOGIN_FAILED"} or any(value in raw for value in (
             "insufficient", "not enough credit", "余额不足", "积分不足", "维护", "登录", "login", "captcha", "rate limit", "risk control", "风控", "验证码",
-            "not available for this account", "restricted for this account")):
+            "not available for this account", "restricted for this account", "exceeds your quota")):
         public = "上游维护中，请稍后再试~"
         category = "provider_unavailable"
     return {"code": kind, "message": public, "public_message": public, "category": category}

@@ -49,6 +49,45 @@ class EleError(BrowserError):
     pass
 
 
+class AccountQuotaRejected(BrowserRejected):
+    """A complete business response explicitly rejected this unpaid request."""
+    submit_outcome = "not_accepted"
+
+    def __init__(self, message: str, *, remaining_credits: float | None = None,
+                 required_credits: float | None = None):
+        super().__init__(message)
+        self.remaining_credits = remaining_credits
+        self.required_credits = required_credits
+
+
+class AccountModelUnavailable(BrowserRejected):
+    """The authenticated model directory denied this account before generation."""
+    code = "ACCOUNT_MODEL_UNAVAILABLE"
+    submit_outcome = "not_accepted"
+
+    def __init__(self, message: str, *, model: str):
+        super().__init__(message)
+        self.model = model
+
+
+def _quota_rejection(detail: Any, message: str) -> dict[str, float | None] | None:
+    code = str(detail.get("status") or detail.get("code") or "").lower() if isinstance(detail, dict) else ""
+    if any(marker in message.lower() for marker in (
+            "detected_unusual_activity", "unusual activity", "terms of service", "captcha", "invalid_api_key")):
+        return None
+    remaining = re.search(r"\b([0-9]+(?:\.[0-9]+)?)\s+credits?\s+remaining\b", message, re.I)
+    required = re.search(r"\b([0-9]+(?:\.[0-9]+)?)\s+credits?\s+(?:are\s+)?required\b", message, re.I)
+    amounts = {"remaining_credits": float(remaining[1]) if remaining else None,
+               "required_credits": float(required[1]) if required else None}
+    amounts = {key: value if value is not None and math.isfinite(value) else None for key, value in amounts.items()}
+    observed_quota = ("this request exceeds your quota" in message.lower()
+                      and amounts["remaining_credits"] is not None and amounts["required_credits"] is not None
+                      and amounts["required_credits"] > amounts["remaining_credits"])
+    if code in {"quota_exceeded", "insufficient_credits", "insufficient_balance", "insufficient_quota"} or (not code and observed_quota):
+        return amounts
+    return None
+
+
 def _reference(item: dict[str, Any]) -> dict[str, str]:
     asset_id = str(item.get("content_asset_id") or "")
     if not _VALID_ID.fullmatch(asset_id):
@@ -193,8 +232,15 @@ class EleClient:
             raise EleError("ElevenLabs response is unreadable; request outcome is unknown") from exc
         if not isinstance(value, dict):
             raise EleError("ElevenLabs response envelope is invalid")
+        envelopes = [value, value["detail"]] if isinstance(value.get("detail"), dict) else [value]
+        received = any(record.get(key) for record in envelopes for key in (
+            "id", "run_id", "thread_id", "generation_id", "session_id", "task_id", "iterations", "generations"))
+        uncertain = any(record.get("uncertain") is True
+                        or str(record.get("status") or "").lower() == "submission_unknown"
+                        or str(record.get("outcome") or record.get("submit_outcome") or "").lower() in {"unknown", "uncertain"}
+                        for record in envelopes)
         ambiguous_http = response.status_code >= 500 or response.status_code in {408, 425, 429}
-        if generation and (ambiguous_http or (not response.ok and (value.get("id") or value.get("iterations")))):
+        if generation and (ambiguous_http or uncertain or ((not response.ok or "detail" in value) and received)):
             raise EleError(f"ElevenLabs generation response is ambiguous (HTTP {response.status_code}); do not resubmit")
         if not response.ok or "detail" in value:
             detail = value.get("detail") or {}
@@ -202,6 +248,12 @@ class EleClient:
                 raise EleError("ElevenLabs generation acceptance is uncertain; do not resubmit")
             message = str(detail.get("message") or detail.get("status") or detail.get("code") or "request rejected") if isinstance(detail, dict) else str(detail)
             message = re.sub(r"https?://[^\s\"']+", "[url]", message)[:500]
+            quota = _quota_rejection(detail, message)
+            if (method.upper() == "POST" and path in {GENERATION, GENERATION + "/price", GENERATION + "/check-references"}
+                    and response.status_code in {400, 401, 402, 403, 409, 422}
+                    and not received and not uncertain
+                    and quota is not None):
+                raise AccountQuotaRejected(f"ElevenLabs HTTP {response.status_code}: {message}", **quota)
             raise BrowserRejected(f"ElevenLabs HTTP {response.status_code}: {message}")
         return value
 
@@ -235,10 +287,10 @@ class EleClient:
         value = self.request("GET", "/v1/content-generation/models-available", params={"purpose": "generation"})
         matches = [m for m in value.get("models", []) if isinstance(m, dict) and m.get("model_id") == model]
         if not matches:
-            raise BrowserRejected(f"ElevenLabs model {model} is not available for this account")
+            raise AccountModelUnavailable(f"ElevenLabs model {model} is not available for this account", model=model)
         info = matches[0]
         if info.get("is_region_restricted") or info.get("is_synthetic_restricted") or info.get("is_approved_by_workspace_admin") is False:
-            raise BrowserRejected(f"ElevenLabs model {model} is restricted for this account")
+            raise AccountModelUnavailable(f"ElevenLabs model {model} is restricted for this account", model=model)
         self._models_checked.add(model)
 
     def _upload_input(self, source: str, kind: str, account_id: int) -> dict[str, Any]:
@@ -332,7 +384,9 @@ class EleClient:
         status = str(value.get("status") or "").lower()
         if status in {"failed", "error", "cancelled", "canceled"}:
             message = value.get("error_message") or value.get("failure_reason") or "Generation failed"
-            return {"status": "failed", "error_code": "UPSTREAM_FAILED", "error_message": str(message)[:1000],
+            code = {"provider_moderation": "CONTENT_MODERATION_FAILED", "model_error": "UPSTREAM_MODEL_ERROR"}.get(
+                value.get("failure_reason"), "UPSTREAM_FAILED")
+            return {"status": "failed", "error_code": code, "error_message": str(message)[:1000],
                     "upstream_status": status, "cost_evidence": {"source": "unknown"}}
         if status == "completed":
             urls = extract_result_urls(value)
